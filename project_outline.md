@@ -115,6 +115,13 @@ This distinction is crucial for accurate child type detection.
   - School selection page should never appear now
 - **Impact**: Authentication works exactly like manual browser login - clean, simple, reliable
 
+### Dynamic Login Form Parsing (v0.0.99) - 2026-01-25
+- **Issue**: Login flow became brittle when InfoMentor changed form fields or added non-hidden inputs
+- **Fix**: Parse the live login form each attempt, capturing hidden fields, selects, checkboxes, and submit buttons
+- **Fallback**: If the expected login form is missing, refresh the login page and re-parse before submitting credentials
+- **Additional Safeguard**: Merge hidden fields (including the encoded viewstate and IdP list) into the payload and set the login postback target
+- **Impact**: Authentication adapts to portal changes without hard-coded field names or stale form data
+
 ### School Selection Scoring Overhaul (v0.0.97) - 2025-12-09
 - **NOTE**: This entire approach was based on a misunderstanding. See v0.0.98 for correct fix.
 - **What we thought**: Need to select one of 89 schools by navigating to its URL

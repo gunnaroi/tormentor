@@ -97,6 +97,8 @@ This ensures accurate classification even when timetable data is temporarily una
   - /tmp/infomentor_debug_oauth.html
   - /tmp/infomentor_debug_dashboard.html
 - These can help detect changes in InfoMentor's login process.
+- Login form submission now parses and submits the exact form fields (including selects, checkboxes, and submit buttons) and refreshes the login page when fields are missing, improving resilience to portal changes.
+- If the live form includes the embedded school list or encoded viewstate, those hidden fields are now merged into the payload and the login postback target is set explicitly.
 
 ### School Selection Heuristics
 

@@ -8,15 +8,25 @@ import html
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
 import aiohttp
-from urllib.parse import urljoin as _urljoin
+from urllib.parse import urljoin as _urljoin, urlparse, parse_qs, urlencode
 
 from .exceptions import InfoMentorAuthError, InfoMentorConnectionError
+from .form_utils import ParsedForm, build_login_form_data, extract_hidden_fields, parse_forms, select_login_form
 
 _LOGGER = logging.getLogger(__name__)
 
 HUB_BASE_URL = "https://hub.infomentor.se"
 MODERN_BASE_URL = "https://im.infomentor.se"
 LEGACY_BASE_URL = "https://infomentor.se/swedish/production/mentor/"
+
+OAUTH_LOGIN_URL = f"{HUB_BASE_URL}/Authentication/Authentication/Login?apiType=IM1&forceOAuth=true"
+OAUTH_LOGIN_URL_WITH_INSTANCE = f"{OAUTH_LOGIN_URL}&apiInstance="
+
+EVENTTARGET_FIELD = "__EVENTTARGET"
+EVENTARGUMENT_FIELD = "__EVENTARGUMENT"
+VIEWSTATE_FIELD = "__VIEWSTATE"
+EVENTVALIDATION_FIELD = "__EVENTVALIDATION"
+IDP_REPEATER_TOKEN = "IdpListRepeater"
 
 # Request delay to be respectful to InfoMentor servers
 REQUEST_DELAY = 0.3  # Reduced from 0.8s to 0.3s - mobile apps are typically faster
@@ -429,6 +439,119 @@ class InfoMentorAuth:
 			return True
 		
 		return False
+
+	def _select_login_form(self, html_content: str) -> Optional[ParsedForm]:
+		"""Select the most likely credential form from HTML content."""
+		forms = parse_forms(html_content)
+		assert forms is not None
+		if not forms:
+			return None
+		return select_login_form(forms)
+
+	def _resolve_form_action(self, base_url: str, action: Optional[str]) -> str:
+		"""Resolve a form action relative to the base URL."""
+		if not action:
+			return base_url
+		return _urljoin(base_url, html.unescape(action))
+
+	def _get_origin(self, url: str) -> Optional[str]:
+		"""Build the origin string for a URL."""
+		try:
+			parsed = urlparse(url)
+			if parsed.scheme and parsed.netloc:
+				return f"{parsed.scheme}://{parsed.netloc}"
+		except Exception as err:
+			_LOGGER.debug(f"Could not parse origin from url {url}: {err}")
+		return None
+
+	async def _fetch_login_page(self, url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[str, str, int]:
+		"""Fetch a login page and return (text, final_url, status)."""
+		use_headers = headers or DEFAULT_HEADERS.copy()
+		await asyncio.sleep(REQUEST_DELAY)
+		async with self.session.get(url, headers=use_headers, allow_redirects=True) as resp:
+			text = await resp.text()
+			return text, str(resp.url), resp.status
+
+	def _ensure_form_field(self, form_fields: List[Tuple[str, str]], field_name: str, value: str) -> None:
+		"""Ensure a form field is present with the provided value."""
+		assert field_name
+		for idx, (name, _) in enumerate(form_fields):
+			if name == field_name:
+				form_fields[idx] = (field_name, value)
+				return
+		form_fields.append((field_name, value))
+
+	def _merge_hidden_fields(self, form_fields: List[Tuple[str, str]], html_content: str) -> int:
+		"""Merge hidden inputs from raw HTML into the form fields."""
+		added = 0
+		hidden_fields = extract_hidden_fields(html_content)
+		existing_names = {name for name, _ in form_fields}
+
+		for name, value in hidden_fields:
+			if name in existing_names:
+				continue
+			form_fields.append((name, value))
+			existing_names.add(name)
+			added += 1
+
+		return added
+
+	def _count_idp_fields(self, form_fields: List[Tuple[str, str]]) -> int:
+		"""Count IdP list entries included in the form fields."""
+		return sum(
+			1
+			for name, _ in form_fields
+			if IDP_REPEATER_TOKEN in name and name.endswith("$url")
+		)
+
+	def _has_hub_payload(self, html_content: str) -> bool:
+		"""Detect hub payload markers in HTML content."""
+		return (
+			"IMHome.home.homeData" in html_content
+			or "IMHome.home.init" in html_content
+			or "IMHome =" in html_content
+		)
+
+	async def _submit_parsed_form(
+		self,
+		form: ParsedForm,
+		form_url: str,
+		form_fields: List[Tuple[str, str]],
+		referer: str,
+	) -> Tuple[int, str, str]:
+		"""Submit a parsed form and return (status, final_url, response_text)."""
+		assert form_url
+		assert isinstance(form_fields, list)
+
+		headers = DEFAULT_HEADERS.copy()
+		origin = self._get_origin(form_url)
+		if origin:
+			headers["Origin"] = origin
+		headers["Referer"] = referer
+		headers["Sec-Fetch-Dest"] = "document"
+		headers["Sec-Fetch-Site"] = "same-origin"
+
+		method = (form.method or "post").lower()
+		enctype = (form.enctype or "").lower()
+		is_multipart = "multipart/form-data" in enctype
+
+		if method == "get":
+			async with self.session.get(form_url, headers=headers, params=form_fields, allow_redirects=True) as resp:
+				text = await resp.text()
+				return resp.status, str(resp.url), text
+
+		if is_multipart:
+			form_data = aiohttp.FormData()
+			for name, value in form_fields:
+				form_data.add_field(name, value)
+			payload = form_data
+		else:
+			headers["Content-Type"] = "application/x-www-form-urlencoded"
+			payload = urlencode(form_fields)
+
+		async with self.session.post(form_url, headers=headers, data=payload, allow_redirects=True) as resp:
+			text = await resp.text()
+			return resp.status, str(resp.url), text
 	
 	async def login(self, username: str, password: str) -> bool:
 		"""Authenticate with InfoMentor using OAuth flow.
@@ -543,7 +666,7 @@ class InfoMentorAuth:
 		Handles auto-submit OpenID forms and credential forms without requiring a prior oauth_token.
 		"""
 		headers = DEFAULT_HEADERS.copy()
-		login_url = f"{HUB_BASE_URL}/Authentication/Authentication/Login?apiType=IM1&forceOAuth=true"
+		login_url = OAUTH_LOGIN_URL
 		last_text = ""
 		last_url = login_url
 		# Visit login page
@@ -560,7 +683,8 @@ class InfoMentorAuth:
 				last_text = result.final_text or last_text
 				last_url = result.final_url or last_url
 		# If a credential form is present, submit credentials
-		if any(key in last_text.lower() for key in ['txtnotandanafn', 'txtlykilord']):
+		login_form = self._select_login_form(last_text)
+		if login_form:
 			await self._submit_credentials_and_handle_second_oauth(last_text, username, password, last_url)
 			return
 		# If an oauth_token appears, submit second token
@@ -576,7 +700,7 @@ class InfoMentorAuth:
 		_LOGGER.info("*** STARTING OAUTH TOKEN EXTRACTION v0.0.39 ***")
 		
 		# Get OAuth token from the OAuth login endpoint
-		oauth_url = f"{HUB_BASE_URL}/Authentication/Authentication/Login?apiType=IM1&forceOAuth=true&apiInstance="
+		oauth_url = OAUTH_LOGIN_URL_WITH_INSTANCE
 		headers = DEFAULT_HEADERS.copy()
 		await asyncio.sleep(REQUEST_DELAY)  # Be respectful to the server
 		
@@ -702,24 +826,21 @@ class InfoMentorAuth:
 				_LOGGER.info("*** NO SCHOOL SELECTION FIELDS v0.0.98 ***")
 			
 			# Check if we need to submit credentials
-			_LOGGER.error(f"*** CHECKING FOR CREDENTIALS v0.0.53 *** txtnotandanafn: {'txtnotandanafn' in stage1_text.lower()}, txtlykilord: {'txtlykilord' in stage1_text.lower()}")
-			if any(field in stage1_text.lower() for field in ['txtnotandanafn', 'txtlykilord']):
-				_LOGGER.error("*** FOUND CREDENTIAL FORM - SUBMITTING v0.0.53 ***")
-				
-				# Extract and submit credentials
+			login_form = self._select_login_form(stage1_text)
+			_LOGGER.error(f"*** CHECKING FOR CREDENTIAL FORM v0.0.99 *** found={bool(login_form)}")
+			if login_form:
+				_LOGGER.error("*** FOUND CREDENTIAL FORM - SUBMITTING v0.0.99 ***")
 				await self._submit_credentials_and_handle_second_oauth(stage1_text, username, password, str(resp.url))
-				_LOGGER.error("*** CREDENTIAL SUBMISSION COMPLETED v0.0.53 ***")
+				_LOGGER.error("*** CREDENTIAL SUBMISSION COMPLETED v0.0.99 ***")
 			else:
-				_LOGGER.error("*** NO CREDENTIAL FORM FOUND v0.0.53 ***")
-				_LOGGER.error(f"*** STAGE 1 SNIPPET v0.0.53 *** {stage1_text[:500]}...")
+				_LOGGER.error("*** NO CREDENTIAL FORM FOUND v0.0.99 ***")
+				_LOGGER.error(f"*** STAGE 1 SNIPPET v0.0.99 *** {stage1_text[:500]}...")
 		except Exception as oauth_completion_err:
 			_LOGGER.error(f"*** OAUTH COMPLETION EXCEPTION v0.0.53 *** {oauth_completion_err}")
 			raise
 	
 	async def _handle_login_callback(self, callback_url: str, response_text: str) -> None:
 		"""Handle LoginCallback URL with oauth_token and oauth_verifier."""
-		from urllib.parse import urlparse, parse_qs
-		
 		_LOGGER.error(f"*** HANDLING LOGINCALLBACK v0.0.53 *** {callback_url}")
 		
 		# Parse the callback URL to extract OAuth parameters
@@ -788,99 +909,117 @@ class InfoMentorAuth:
 	async def _submit_credentials_and_handle_second_oauth(self, form_html: str, username: str, password: str, form_url: str) -> None:
 		"""Submit credentials and handle the second OAuth token."""
 		_LOGGER.debug("Submitting credentials for two-stage OAuth")
-		
-		# Extract form fields
-		form_data = {}
-		
-		# ViewState fields for ASP.NET
-		for field in ['__VIEWSTATE', '__VIEWSTATEGENERATOR', '__EVENTVALIDATION']:
-			pattern = f'{field}["\'][^>]*value=["\']([^"\']+)["\']'
-			match = re.search(pattern, form_html)
-			if match:
-				form_data[field] = match.group(1)
-		
-		# Extract ALL hidden input fields (including school selection fields)
-		# This is crucial - the form contains all school options as hidden fields
-		# InfoMentor needs these to properly route the authentication
-		hidden_pattern = r'<input[^>]*type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']'
-		hidden_matches = re.findall(hidden_pattern, form_html, re.IGNORECASE)
-		for field_name, field_value in hidden_matches:
-			# Don't override the viewstate fields we already extracted
-			if field_name not in form_data:
-				form_data[field_name] = field_value
-		
-		_LOGGER.info(f"Extracted {len(form_data)} form fields (including school selection fields)")
-		
-		# Set form submission fields (these override any hidden fields with same names)
-		form_data.update({
-			'__EVENTTARGET': 'login_ascx$btnLogin',
-			'__EVENTARGUMENT': '',
-			'login_ascx$txtNotandanafn': username,
-			'login_ascx$txtLykilord': password,
-		})
-		
-		headers = DEFAULT_HEADERS.copy()
-		headers.update({
-			"Content-Type": "application/x-www-form-urlencoded",
-			"Origin": "https://infomentor.se",
-			"Referer": form_url,
-			"Sec-Fetch-Site": "same-origin",
-			"Sec-Fetch-Dest": "document",
-		})
-		
-		from urllib.parse import urlencode
-		
-		await asyncio.sleep(REQUEST_DELAY)  # Be respectful to the server
-		async with self.session.post(
-			form_url,
-			headers=headers,
-			data=urlencode(form_data),
-			allow_redirects=True
-		) as resp:
-			cred_text = await resp.text()
-			_LOGGER.error(f"*** CREDENTIALS RESPONSE v0.0.53 *** status={resp.status} url={resp.url}")
-			
-			# Check if credentials led to LoginCallback
-			if "LoginCallback" in str(resp.url):
-				_LOGGER.error("*** CREDENTIALS LED TO LOGINCALLBACK v0.0.53 ***")
-				await self._handle_login_callback(str(resp.url), cred_text)
-				return
-			
-			# Check for credential rejection first
-			if "login_ascx" in cred_text.lower() and "txtnotandanafn" in cred_text.lower():
-				# If we still see the login form, credentials were likely rejected
-				_LOGGER.error("Credentials appear to have been rejected")
-				# Log a truncated snippet to aid debugging
-				try:
-					_LOGGER.error(f"Credentials rejection response (truncated): {cred_text[:500]}...")
-				except Exception:
-					pass
-				raise InfoMentorAuthError("Invalid credentials - login form still present after submission")
-			
-			# Look for second OAuth token in the response
-			second_oauth_match = re.search(r'oauth_token"\s+value="([\w+=/]+)"', cred_text)
-			if second_oauth_match:
-				second_oauth_token = second_oauth_match.group(1)
-				_LOGGER.error(f"*** FOUND SECOND OAUTH TOKEN v0.0.53 *** {second_oauth_token[:10]}...")
-				
-				# Submit the second OAuth token
-				await self._submit_second_oauth_token(second_oauth_token)
+
+		if not form_html:
+			raise InfoMentorAuthError("Missing login form HTML for credential submission")
+
+		used_html = form_html
+		used_url = form_url
+		login_form = self._select_login_form(form_html)
+
+		if not login_form:
+			_LOGGER.warning("Login form not found in initial response; reloading login page")
+			try:
+				refreshed_html, refreshed_url, _ = await self._fetch_login_page(form_url)
+				used_html = refreshed_html
+				used_url = refreshed_url
+				login_form = self._select_login_form(refreshed_html)
+			except Exception as refresh_err:
+				_LOGGER.debug(f"Refreshing login page failed: {refresh_err}")
+
+		if not login_form:
+			_LOGGER.error("*** NO LOGIN FORM FOUND v0.0.99 ***")
+			_LOGGER.error(f"*** LOGIN FORM SNIPPET v0.0.99 *** {used_html[:500]}...")
+			raise InfoMentorAuthError("Could not locate login form for credential submission")
+
+		form_action_url = self._resolve_form_action(used_url, login_form.action)
+		form_fields, username_field, password_field, submit_field = build_login_form_data(
+			login_form,
+			username,
+			password,
+		)
+		field_names = [name for name, _ in form_fields]
+		idp_field_count = self._count_idp_fields(form_fields)
+		viewstate_present = VIEWSTATE_FIELD in field_names
+
+		if (IDP_REPEATER_TOKEN in used_html and idp_field_count == 0) or not viewstate_present:
+			added = self._merge_hidden_fields(form_fields, used_html)
+			field_names = [name for name, _ in form_fields]
+			idp_field_count = self._count_idp_fields(form_fields)
+			viewstate_present = VIEWSTATE_FIELD in field_names
+			_LOGGER.info(
+				"Augmented login payload with %s hidden fields; idp_list=%s viewstate=%s",
+				added,
+				idp_field_count,
+				viewstate_present,
+			)
+
+		if submit_field:
+			if EVENTTARGET_FIELD in field_names or EVENTTARGET_FIELD in used_html:
+				self._ensure_form_field(form_fields, EVENTTARGET_FIELD, submit_field)
+			if EVENTARGUMENT_FIELD in field_names or EVENTARGUMENT_FIELD in used_html:
+				self._ensure_form_field(form_fields, EVENTARGUMENT_FIELD, "")
+
+		assert form_action_url
+		assert isinstance(form_fields, list)
+
+		if not username_field or not password_field:
+			_LOGGER.error("*** LOGIN FIELD DETECTION FAILED v0.0.99 ***")
+			_LOGGER.error(f"*** FORM ACTION v0.0.99 *** {form_action_url}")
+			raise InfoMentorAuthError("Could not identify username/password fields in login form")
+
+		_LOGGER.info(f"Extracted {len(form_fields)} form fields (including non-hidden fields)")
+		_LOGGER.debug(
+			f"Login fields detected: username={username_field}, password={password_field}, submit={submit_field}"
+		)
+		viewstate_value = next((value for name, value in form_fields if name == VIEWSTATE_FIELD), "")
+		if viewstate_value:
+			_LOGGER.debug(f"Viewstate length: {len(viewstate_value)}")
+
+		await asyncio.sleep(REQUEST_DELAY)
+		status, final_url, cred_text = await self._submit_parsed_form(
+			login_form,
+			form_action_url,
+			form_fields,
+			used_url,
+		)
+		_LOGGER.error(f"*** CREDENTIALS RESPONSE v0.0.99 *** status={status} url={final_url}")
+
+		# Check if credentials led to LoginCallback
+		if "LoginCallback" in final_url:
+			_LOGGER.error("*** CREDENTIALS LED TO LOGINCALLBACK v0.0.99 ***")
+			await self._handle_login_callback(final_url, cred_text)
+			return
+
+		# Check for credential rejection first
+		if self._select_login_form(cred_text):
+			_LOGGER.error("Credentials appear to have been rejected")
+			try:
+				_LOGGER.error(f"Credentials rejection response (truncated): {cred_text[:500]}...")
+			except Exception:
+				pass
+			raise InfoMentorAuthError("Invalid credentials - login form still present after submission")
+
+		# Look for second OAuth token in the response
+		second_oauth_match = re.search(r'oauth_token"\s+value="([\w+=/]+)"', cred_text)
+		if second_oauth_match:
+			second_oauth_token = second_oauth_match.group(1)
+			_LOGGER.error(f"*** FOUND SECOND OAUTH TOKEN v0.0.99 *** {second_oauth_token[:10]}...")
+			await self._submit_second_oauth_token(second_oauth_token)
+		else:
+			_LOGGER.error("*** NO SECOND OAUTH TOKEN v0.0.99 *** - checking authentication state")
+
+			success_indicators = [
+				"default.aspx" in final_url.lower(),
+				"hub.infomentor.se" in final_url.lower(),
+				"logout" in cred_text.lower(),
+				"dashboard" in cred_text.lower(),
+			]
+
+			if any(success_indicators):
+				_LOGGER.error("*** CREDENTIALS ACCEPTED WITHOUT SECOND OAUTH v0.0.99 ***")
 			else:
-				_LOGGER.error("*** NO SECOND OAUTH TOKEN v0.0.53 *** - checking authentication state")
-				
-				# Check for signs of successful authentication
-				success_indicators = [
-					"default.aspx" in str(resp.url).lower(),
-					"hub.infomentor.se" in str(resp.url).lower(),
-					"logout" in cred_text.lower(),
-					"dashboard" in cred_text.lower()
-				]
-				
-				if any(success_indicators):
-					_LOGGER.error("*** CREDENTIALS ACCEPTED WITHOUT SECOND OAUTH v0.0.53 ***")
-				else:
-					_LOGGER.error("*** UNCLEAR AUTHENTICATION STATE v0.0.53 ***")
-					# Continue anyway as the authentication might still work
+				_LOGGER.error("*** UNCLEAR AUTHENTICATION STATE v0.0.99 ***")
 	
 	async def _submit_second_oauth_token(self, oauth_token: str) -> None:
 		"""Submit the second OAuth token to complete authentication."""
@@ -1253,144 +1392,86 @@ class InfoMentorAuth:
 	async def _direct_login_with_credentials(self, username: str, password: str) -> None:
 		"""Login directly using username/password on the main InfoMentor login page."""
 		_LOGGER.error("*** STARTING DIRECT LOGIN v0.0.51 ***")
-		
-		# Go to the main login page
-		login_url = "https://infomentor.se/swedish/production/mentor/"
+
+		login_url = LEGACY_BASE_URL
 		headers = DEFAULT_HEADERS.copy()
-		
+
 		try:
-			# First, get the login page to see the form
+			login_page, final_login_url, status = await self._fetch_login_page(login_url, headers)
+			_LOGGER.error(f"*** LOGIN PAGE RESPONSE v0.0.51 *** {status} -> {final_login_url}")
+			_LOGGER.error(f"*** LOGIN PAGE LENGTH v0.0.51 *** {len(login_page)} chars")
+
+			await _write_text_file_async("/tmp/infomentor_login_page.html", login_page)
+			_LOGGER.error("*** SAVED LOGIN PAGE v0.0.51 *** /tmp/infomentor_login_page.html")
+
+			login_form = self._select_login_form(login_page)
+			if not login_form:
+				_LOGGER.error("*** NO LOGIN FORM FOUND v0.0.51 ***")
+				raise InfoMentorAuthError("Could not find login form on main page")
+
+			form_action_url = self._resolve_form_action(final_login_url, login_form.action)
+			form_fields, username_field, password_field, submit_field = build_login_form_data(
+				login_form,
+				username,
+				password,
+			)
+
+			if not username_field or not password_field:
+				_LOGGER.error("*** COULD NOT FIND LOGIN FIELDS v0.0.51 ***")
+				raise InfoMentorAuthError("Could not find username/password fields")
+
+			field_names = [name for name, _ in form_fields]
+			_LOGGER.error(
+				f"*** LOGIN FIELDS v0.0.51 *** username={username_field}, password={password_field}, submit={submit_field}"
+			)
+			_LOGGER.error(f"*** SUBMITTING LOGIN FORM v0.0.51 *** {form_action_url}")
+			_LOGGER.error(f"*** FORM FIELD COUNT v0.0.51 *** {len(field_names)}")
+			_LOGGER.debug(f"*** FORM FIELD SAMPLE v0.0.51 *** {field_names[:15]}")
+
 			await asyncio.sleep(REQUEST_DELAY)
-			async with self.session.get(login_url, headers=headers) as resp:
-				login_page = await resp.text()
-				_LOGGER.error(f"*** LOGIN PAGE RESPONSE v0.0.51 *** {resp.status} -> {resp.url}")
-				_LOGGER.error(f"*** LOGIN PAGE LENGTH v0.0.51 *** {len(login_page)} chars")
-				
-				# Save for debugging
-				await _write_text_file_async("/tmp/infomentor_login_page.html", login_page)
-				_LOGGER.error("*** SAVED LOGIN PAGE v0.0.51 *** /tmp/infomentor_login_page.html")
-				
-				# Look for the login form
-				import re
-				
-				# Find the form action URL
-				form_pattern = r'<form[^>]*action=["\']([^"\']*)["\'][^>]*>'
-				form_match = re.search(form_pattern, login_page, re.IGNORECASE)
-				
-				if not form_match:
-					_LOGGER.error("*** NO LOGIN FORM FOUND v0.0.51 ***")
-					raise InfoMentorAuthError("Could not find login form on main page")
-				
-				form_action = form_match.group(1)
-				_LOGGER.error(f"*** FOUND LOGIN FORM v0.0.51 *** action={form_action}")
-				
-				# Look for username and password field names
-				username_patterns = [
-					r'<input[^>]*name=["\']([^"\']*)["\'][^>]*(?:type=["\']text["\']|type=["\']email["\'])',
-					r'<input[^>]*(?:type=["\']text["\']|type=["\']email["\'])[^>]*name=["\']([^"\']*)["\']'
+			status, final_url, login_result = await self._submit_parsed_form(
+				login_form,
+				form_action_url,
+				form_fields,
+				final_login_url,
+			)
+			_LOGGER.error(f"*** LOGIN RESULT v0.0.51 *** {status} -> {final_url}")
+			_LOGGER.error(f"*** LOGIN RESULT LENGTH v0.0.51 *** {len(login_result)} chars")
+
+			await _write_text_file_async("/tmp/infomentor_login_result.html", login_result)
+			_LOGGER.error("*** SAVED LOGIN RESULT v0.0.51 *** /tmp/infomentor_login_result.html")
+
+			success_indicators = [
+				"student-menu",
+				"pupil-selection",
+				"dashboard",
+				"mentor-main",
+				"logout",
+				"logga ut",
+			]
+
+			is_success = any(indicator in login_result.lower() for indicator in success_indicators)
+
+			if is_success:
+				_LOGGER.error("*** DIRECT LOGIN SUCCESS v0.0.51 ***")
+			else:
+				error_indicators = [
+					"felaktigt",
+					"error",
+					"failed",
+					"invalid",
+					"wrong",
 				]
-				
-				password_patterns = [
-					r'<input[^>]*name=["\']([^"\']*)["\'][^>]*type=["\']password["\']',
-					r'<input[^>]*type=["\']password["\'][^>]*name=["\']([^"\']*)["\']'
-				]
-				
-				username_field = None
-				password_field = None
-				
-				for pattern in username_patterns:
-					match = re.search(pattern, login_page, re.IGNORECASE)
-					if match:
-						username_field = match.group(1)
-						break
-				
-				for pattern in password_patterns:
-					match = re.search(pattern, login_page, re.IGNORECASE)
-					if match:
-						password_field = match.group(1)
-						break
-				
-				_LOGGER.error(f"*** LOGIN FIELDS v0.0.51 *** username={username_field}, password={password_field}")
-				
-				if not username_field or not password_field:
-					_LOGGER.error("*** COULD NOT FIND LOGIN FIELDS v0.0.51 ***")
-					raise InfoMentorAuthError("Could not find username/password fields")
-				
-				# Prepare form data
-				form_data = {
-					username_field: username,
-					password_field: password
-				}
-				
-				# Look for any hidden fields (CSRF tokens, etc.)
-				hidden_pattern = r'<input[^>]*type=["\']hidden["\'][^>]*name=["\']([^"\']*)["\'][^>]*value=["\']([^"\']*)["\']'
-				hidden_matches = re.findall(hidden_pattern, login_page, re.IGNORECASE)
-				
-				for field_name, field_value in hidden_matches:
-					form_data[field_name] = field_value
-					_LOGGER.error(f"*** HIDDEN FIELD v0.0.51 *** {field_name}={field_value}")
-				
-				# Construct the full form action URL
-				if form_action.startswith('/'):
-					form_url = f"https://infomentor.se{form_action}"
-				elif not form_action.startswith('http'):
-					form_url = f"https://infomentor.se/swedish/production/mentor/{form_action}"
+
+				has_error = any(indicator in login_result.lower() for indicator in error_indicators)
+
+				if has_error:
+					_LOGGER.error("*** DIRECT LOGIN FAILED - INVALID CREDENTIALS v0.0.51 ***")
+					raise InfoMentorAuthError("Invalid username or password")
 				else:
-					form_url = form_action
-				
-				_LOGGER.error(f"*** SUBMITTING LOGIN FORM v0.0.51 *** {form_url}")
-				_LOGGER.error(f"*** FORM DATA v0.0.51 *** {list(form_data.keys())}")
-				
-				# Submit the login form
-				headers.update({
-					"Content-Type": "application/x-www-form-urlencoded",
-					"Referer": login_url,
-					"Origin": "https://infomentor.se"
-				})
-				
-				await asyncio.sleep(REQUEST_DELAY)
-				async with self.session.post(form_url, data=form_data, headers=headers, allow_redirects=True) as resp:
-					login_result = await resp.text()
-					_LOGGER.error(f"*** LOGIN RESULT v0.0.51 *** {resp.status} -> {resp.url}")
-					_LOGGER.error(f"*** LOGIN RESULT LENGTH v0.0.51 *** {len(login_result)} chars")
-					
-					# Save for debugging
-					await _write_text_file_async("/tmp/infomentor_login_result.html", login_result)
-					_LOGGER.error("*** SAVED LOGIN RESULT v0.0.51 *** /tmp/infomentor_login_result.html")
-					
-					# Check if login was successful (look for signs of the main dashboard)
-					success_indicators = [
-						"student-menu",  # Main menu for students
-						"pupil-selection", # Pupil selection
-						"dashboard",  # Dashboard elements
-						"mentor-main", # Main mentor interface
-						"logout",  # Logout link indicates successful login
-						"logga ut"  # Swedish logout
-					]
-					
-					is_success = any(indicator in login_result.lower() for indicator in success_indicators)
-					
-					if is_success:
-						_LOGGER.error("*** DIRECT LOGIN SUCCESS v0.0.51 ***")
-					else:
-						# Check for error messages
-						error_indicators = [
-							"felaktigt",  # Incorrect (Swedish)
-							"error",
-							"failed",
-							"invalid",
-							"wrong"
-						]
-						
-						has_error = any(indicator in login_result.lower() for indicator in error_indicators)
-						
-						if has_error:
-							_LOGGER.error("*** DIRECT LOGIN FAILED - INVALID CREDENTIALS v0.0.51 ***")
-							raise InfoMentorAuthError("Invalid username or password")
-						else:
-							_LOGGER.error("*** DIRECT LOGIN UNCLEAR RESULT v0.0.51 ***")
-							_LOGGER.error(f"*** RESULT SAMPLE v0.0.51 *** {login_result[:500]}...")
-		
+					_LOGGER.error("*** DIRECT LOGIN UNCLEAR RESULT v0.0.51 ***")
+					_LOGGER.error(f"*** RESULT SAMPLE v0.0.51 *** {login_result[:500]}...")
+
 		except Exception as e:
 			_LOGGER.error(f"*** DIRECT LOGIN EXCEPTION v0.0.51 *** {e}")
 			raise
@@ -1607,8 +1688,11 @@ class InfoMentorAuth:
 					except Exception as e_reauth:
 						_LOGGER.debug(f"Reauthentication attempt failed: {e_reauth}")
 
-				# Check if we're on the legacy interface (auto-submit result)
-				if "infomentor.se/swedish/production/mentor/" in str(resp.url) or "mentor/" in text:
+				# Prefer hub extraction if hub payload is present, even if legacy URLs appear
+				if self._has_hub_payload(text):
+					_LOGGER.error("*** HUB PAYLOAD DETECTED - USING HUB JSON EXTRACTION v0.0.70 ***")
+					pupil_ids = self._extract_pupil_ids_from_json(text)
+				elif "infomentor.se/swedish/production/mentor/" in str(resp.url) or "mentor/" in text:
 					_LOGGER.error("*** DETECTED LEGACY INTERFACE - USING LEGACY EXTRACTION v0.0.70 ***")
 					pupil_ids = await self._extract_pupil_ids_legacy(text)
 				else:
@@ -1655,7 +1739,10 @@ class InfoMentorAuth:
 								except Exception as e_reauth2:
 									_LOGGER.debug(f"Reauthentication via alt URL failed: {e_reauth2}")
 							# Check if we're on the legacy interface from alternative URL
-							if "infomentor.se/swedish/production/mentor/" in str(alt_resp.url) or "mentor/" in alt_text:
+							if self._has_hub_payload(alt_text):
+								_LOGGER.error("*** HUB PAYLOAD DETECTED FROM ALT URL - USING HUB JSON EXTRACTION v0.0.70 ***")
+								pupil_ids = self._extract_pupil_ids_from_json(alt_text)
+							elif "infomentor.se/swedish/production/mentor/" in str(alt_resp.url) or "mentor/" in alt_text:
 								_LOGGER.error("*** DETECTED LEGACY INTERFACE FROM ALT URL - USING LEGACY EXTRACTION v0.0.70 ***")
 								pupil_ids = await self._extract_pupil_ids_legacy(alt_text)
 							else:
