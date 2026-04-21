@@ -14,7 +14,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .infomentor.client import InfoMentorClient
 from .infomentor.exceptions import InfoMentorAuthError, InfoMentorConnectionError
-from .infomentor.models import NewsItem, TimelineEntry, PupilInfo, ScheduleDay, TimetableEntry, TimeRegistrationEntry
+from .infomentor.models import NewsItem, TimelineEntry, PupilInfo, ScheduleDay, TimetableEntry, TimeRegistrationEntry, InfoMentorNotification
 from .storage import InfoMentorStorage
 from .schedule_guard import (
 	SCHEDULE_STATUS_CACHED,
@@ -24,13 +24,16 @@ from .schedule_guard import (
 )
 
 from .const import (
-	DOMAIN, 
-	DEFAULT_UPDATE_INTERVAL, 
+	DOMAIN,
+	DEFAULT_UPDATE_INTERVAL,
 	RETRY_INTERVAL_HOURS,
 	RETRY_INTERVAL_MINUTES_FAST,
 	MAX_FAST_RETRIES,
 	AUTH_BACKOFF_MINUTES,
-	MAX_AUTH_FAILURES_BEFORE_BACKOFF
+	MAX_AUTH_FAILURES_BEFORE_BACKOFF,
+	EVENT_NEW_NOTIFICATION,
+	CONF_NOTIFY_SERVICES,
+	NOTIFICATION_CHECK_INTERVAL_MINUTES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -64,6 +67,17 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		self._stale_retry_logged = False
 		self._stale_retry_jitter_minutes: Optional[int] = None
 		
+		# Notification tracking
+		self._seen_notification_ids: set[int] = set()
+		self._last_notification_check: Optional[datetime] = None
+		self._notifications: List[InfoMentorNotification] = []
+
+		# Ring buffer of recent diagnostic events, surfaced via the
+		# "InfoMentor Diagnostic Log" sensor and the HA diagnostics download,
+		# so users don't need shell access to the VM to see what's happening.
+		self._diag_events: List[Dict[str, Any]] = []
+		self._diag_events_max = 50
+
 		# Schedule caching for today/tomorrow resilience
 		self._cached_today_schedule: Dict[str, Optional[ScheduleDay]] = {}
 		self._cached_tomorrow_schedule: Dict[str, Optional[ScheduleDay]] = {}
@@ -96,27 +110,24 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 					if cached_data:
 						_LOGGER.info("Have recent cached data (< 72 hours), loading from storage and skipping authentication attempt")
 						self._using_cached_data = True
-						# Deserialize cached dict data back to model objects
 						try:
 							self.data = self._deserialize_cached_data(cached_data)
 							_LOGGER.debug(f"Successfully deserialized cached data for {len(self.data)} pupils")
 						except Exception as e:
 							_LOGGER.warning(f"Failed to deserialize cached data: {e}")
-							# If deserialization fails, clear data and try fresh fetch
 							self.data = None
-							# Don't return here, let it fall through to normal auth
 						else:
-							# Update the schedule cache from cached data
 							self._update_schedule_cache()
-							# Schedule a background auth check for later (non-blocking)
 							self.hass.async_create_task(self._background_auth_check())
+							# Still check notifications even when using cached data
+							self.hass.async_create_task(self._background_notification_check())
 							return self.data
 				else:
 					_LOGGER.info("Have recent cached data (< 72 hours), skipping authentication attempt")
 					self._using_cached_data = True
-					# Periodically verify authentication in the background
 					if self._should_check_auth_in_background():
 						self.hass.async_create_task(self._background_auth_check())
+					self.hass.async_create_task(self._background_notification_check())
 					return self.data
 			
 			# Check if we should back off due to recent auth failures
@@ -240,7 +251,13 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			
 			# Save successful data to persistent storage
 			await self._save_data_to_storage(data, is_complete_schedule)
-			
+
+			# Check for new notifications (non-blocking)
+			try:
+				await self._check_notifications()
+			except Exception as notif_err:
+				_LOGGER.debug("Notification check failed (non-critical): %s", notif_err)
+
 			return data
 			
 		except InfoMentorAuthError as err:
@@ -723,6 +740,130 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		except Exception as e:
 			_LOGGER.warning(f"Error loading cached data: {e}")
 	
+	# ------------------------------------------------------------------
+	# Notification helpers
+	# ------------------------------------------------------------------
+
+	async def _check_notifications(self) -> None:
+		"""Fetch InfoMentor notifications and fire HA events for new ones."""
+		if not self.client:
+			return
+
+		now = datetime.now()
+		if (
+			self._last_notification_check
+			and (now - self._last_notification_check).total_seconds()
+			< NOTIFICATION_CHECK_INTERVAL_MINUTES * 60
+		):
+			return
+
+		self._last_notification_check = now
+
+		try:
+			notifications = await self.client.get_notifications()
+		except Exception as err:
+			_LOGGER.debug("Could not fetch notifications: %s", err)
+			return
+
+		self._notifications = notifications
+		new_notifications: List[InfoMentorNotification] = []
+
+		for notif in notifications:
+			if notif.id not in self._seen_notification_ids:
+				self._seen_notification_ids.add(notif.id)
+				if notif.is_new:
+					new_notifications.append(notif)
+
+		if not new_notifications:
+			return
+
+		_LOGGER.info("Found %d new InfoMentor notifications", len(new_notifications))
+
+		# Build pupil name lookup from current data
+		pupil_names: Dict[int, str] = {}
+		for pid, info in self.pupils_info.items():
+			if info.name:
+				try:
+					pupil_names[int(pid)] = info.name
+				except (ValueError, TypeError):
+					pass
+
+		for notif in new_notifications:
+			pupil_name = pupil_names.get(notif.pupil_im2_id, "")
+			event_data = {
+				"id": notif.id,
+				"title": notif.title,
+				"sub_title": notif.sub_title,
+				"date_sent": notif.date_sent.isoformat(),
+				"app_type": notif.app_type,
+				"notification_type": notif.notification_type,
+				"url": notif.full_url,
+				"pupil_name": pupil_name,
+				"pupil_im2_id": notif.pupil_im2_id,
+				"entity_type": notif.entity_type,
+			}
+			self.hass.bus.async_fire(EVENT_NEW_NOTIFICATION, event_data)
+			_LOGGER.debug("Fired %s event for notification %d", EVENT_NEW_NOTIFICATION, notif.id)
+
+		# Send push notifications to configured services
+		await self._send_ha_notifications(new_notifications, pupil_names)
+
+	async def _send_ha_notifications(
+		self,
+		notifications: List[InfoMentorNotification],
+		pupil_names: Dict[int, str],
+	) -> None:
+		"""Send push notifications via HA notify services configured in options."""
+		entry = None
+		for e in self.hass.config_entries.async_entries(DOMAIN):
+			if e.data.get("username") == self.username:
+				entry = e
+				break
+
+		if not entry:
+			return
+
+		raw_services = entry.options.get(CONF_NOTIFY_SERVICES, "")
+		service_list = [s.strip() for s in raw_services.split(",") if s.strip()]
+		if not service_list:
+			return
+
+		for notif in notifications:
+			pupil_name = pupil_names.get(notif.pupil_im2_id, "")
+			title = f"InfoMentor: {notif.title}"
+			body_parts = []
+			if pupil_name:
+				body_parts.append(pupil_name)
+			if notif.sub_title:
+				body_parts.append(notif.sub_title)
+			body_parts.append(notif.date_sent.strftime("%Y-%m-%d %H:%M"))
+			message = " — ".join(body_parts)
+
+			service_data: Dict[str, Any] = {
+				"title": title,
+				"message": message,
+				"data": {
+					"url": notif.full_url,
+					"clickAction": notif.full_url,
+					"tag": f"infomentor_{notif.id}",
+				},
+			}
+
+			for svc in service_list:
+				try:
+					domain, service = "notify", svc
+					if "." in svc:
+						domain, service = svc.split(".", 1)
+					await self.hass.services.async_call(domain, service, service_data)
+					_LOGGER.debug("Sent notification %d via %s.%s", notif.id, domain, service)
+				except Exception as err:
+					_LOGGER.warning("Failed to call %s for notification %d: %s", svc, notif.id, err)
+
+	@property
+	def notifications(self) -> List[InfoMentorNotification]:
+		"""Return the latest fetched notifications."""
+		return list(self._notifications)
+
 	async def _save_data_to_storage(self, data: Dict[str, Any], complete_schedule: bool) -> None:
 		"""Save current data to persistent storage."""
 		try:
@@ -1126,6 +1267,142 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		_LOGGER.info(f"Schedule validation passed for pupil {pupil_id}: Found data for {days_with_data} days")
 		return True
 
+	def _record_diag(self, level: str, message: str, **fields: Any) -> None:
+		"""Append an event to the in-memory diagnostic ring buffer.
+
+		These events are exposed via the "InfoMentor Diagnostic Log" sensor
+		attributes and the HA diagnostics download so users can see what's
+		happening without needing shell access to the VM running HA.
+		"""
+		from datetime import timezone
+		event: Dict[str, Any] = {
+			"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+			"level": level,
+			"message": message,
+		}
+		if fields:
+			event["data"] = fields
+		self._diag_events.append(event)
+		if len(self._diag_events) > self._diag_events_max:
+			del self._diag_events[: len(self._diag_events) - self._diag_events_max]
+
+	@property
+	def diagnostic_events(self) -> List[Dict[str, Any]]:
+		"""Return a copy of the recent diagnostic events ring buffer."""
+		return list(self._diag_events)
+
+	async def async_diagnostic_poke(self, *, clear_cache: bool = False) -> None:
+		"""Manual trigger from UI: refresh session, bypass throttles, then refresh data.
+
+		Use when the integration is stuck on hourly retries, notifications stay empty,
+		or you see HTTP 500 / HTML timetable responses and want an immediate retry.
+		"""
+		_LOGGER.warning(
+			"InfoMentor diagnostics poke started (clear_cache=%s, user=%s)",
+			clear_cache,
+			self.username,
+		)
+		self._record_diag("info", "Diagnostics poke started", clear_cache=clear_cache)
+
+		self._last_notification_check = None
+		self._auth_failure_count = 0
+		self._last_auth_failure = None
+		self._daily_retry_count = 0
+		self._today_data_available = False
+
+		relogin_ok = False
+		try:
+			if self.client and getattr(self.client, "auth", None):
+				await self.client.login(self.username, self.password)
+				self.pupil_ids = list(await self.client.get_pupil_ids())
+				relogin_ok = True
+				_LOGGER.warning(
+					"Diagnostics poke: session refresh OK, pupils=%s",
+					self.pupil_ids,
+				)
+				self._record_diag("info", "Session refresh OK", pupils=self.pupil_ids)
+			else:
+				_LOGGER.warning(
+					"Diagnostics poke: no active client yet; full setup will run on refresh",
+				)
+				self._record_diag("warning", "No active client; full setup deferred")
+		except Exception as err:
+			_LOGGER.warning(
+				"Diagnostics poke: re-login failed (%s); will create a new client on refresh",
+				err,
+			)
+			self._record_diag("error", "Re-login failed", error=str(err))
+			if self.client:
+				try:
+					await self.client.__aexit__(None, None, None)
+				except Exception:
+					pass
+				self.client = None
+
+		n_cookies = 0
+		cookies_by_domain: dict[str, int] = {}
+		if self._session and getattr(self._session, "cookie_jar", None):
+			for cookie in self._session.cookie_jar:
+				n_cookies += 1
+				try:
+					dom = cookie["domain"] or "?"
+				except Exception:
+					dom = "?"
+				cookies_by_domain[dom] = cookies_by_domain.get(dom, 0) + 1
+		_LOGGER.warning(
+			"Diagnostics poke: aiohttp cookies=%d (by domain: %s), relogin_ok=%s",
+			n_cookies,
+			", ".join(f"{d}={c}" for d, c in sorted(cookies_by_domain.items())) or "none",
+			relogin_ok,
+		)
+		self._record_diag(
+			"info",
+			"Cookie state",
+			total=n_cookies,
+			by_domain=cookies_by_domain,
+			relogin_ok=relogin_ok,
+		)
+
+		if relogin_ok and self.client:
+			try:
+				warmup_ok = await self.client.warmup_hub_session()
+				_LOGGER.warning("Diagnostics poke: hub warmup ok=%s", warmup_ok)
+				self._record_diag("info", "Hub warmup", ok=warmup_ok)
+			except Exception as err:
+				_LOGGER.warning("Diagnostics poke: hub warmup raised: %s", err)
+				self._record_diag("error", "Hub warmup raised", error=str(err))
+
+		if clear_cache:
+			self._cached_today_schedule.clear()
+			self._cached_tomorrow_schedule.clear()
+			self._last_schedule_cache_update = None
+			_LOGGER.warning("Diagnostics poke: cleared in-memory schedule cache")
+
+		await self.async_refresh()
+
+		# The cached-data path inside `_async_update_data` fires
+		# `_background_notification_check()` as a detached task, so the buffer
+		# may still be empty when async_refresh() returns. Run the check here
+		# synchronously so the final log line reports the real number and new
+		# notifications are pushed immediately.
+		self._last_notification_check = None
+		try:
+			await self._check_notifications()
+		except Exception as err:
+			_LOGGER.warning("Diagnostics poke: synchronous notification check failed: %s", err)
+			self._record_diag("error", "Notification check failed", error=str(err))
+
+		_LOGGER.warning(
+			"Diagnostics poke finished: notification_buffer_len=%d",
+			len(self._notifications),
+		)
+		self._record_diag(
+			"info",
+			"Diagnostics poke finished",
+			notifications=len(self._notifications),
+		)
+		self.async_update_listeners()
+
 	async def force_refresh(self, clear_cache: bool = True) -> None:
 		"""Force a complete data refresh, optionally clearing caches.
 		
@@ -1221,6 +1498,15 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			_LOGGER.warning(f"Background authentication check failed (will continue using cached data): {e}")
 			# Don't raise - this is a background check, failures are non-critical
 	
+	async def _background_notification_check(self) -> None:
+		"""Check notifications in the background without blocking updates."""
+		try:
+			if not self.client or not self.client.authenticated:
+				return
+			await self._check_notifications()
+		except Exception as e:
+			_LOGGER.debug("Background notification check failed: %s", e)
+
 	async def debug_authentication(self) -> dict:
 		"""Debug authentication process and return detailed information.
 		

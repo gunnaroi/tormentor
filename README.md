@@ -12,6 +12,7 @@ This custom component integrates InfoMentor school communication platform with H
 - **News & Timeline**: Get school news and timeline entries
 - **Child Type Detection**: Automatically distinguish between school and preschool children
 - **Robust Authentication**: Secure login with session management
+- **Push Notifications**: Alternative to the broken InfoMentor Android push — sends new notices to your phone via HA
 
 ### Sensors Created
 
@@ -30,6 +31,9 @@ For each pupil, the integration creates several sensors:
 #### Communication Sensors
 - **News**: Count and details of unread school news
 - **Timeline**: Count and details of timeline entries
+
+#### Notification Sensors
+- **Notifications**: Unread notification count; attributes include the latest 20 notifications with title, date, type, pupil, URL, and state
 
 #### System Sensors
 - **Pupil Count**: Total number of children in the account
@@ -88,6 +92,62 @@ This ensures accurate classification even when timetable data is temporarily una
 - You can update your InfoMentor username/password via the integration's Options.
 - The options form validates the credentials against InfoMentor before saving.
 - On success, the integration reloads immediately with the new credentials.
+
+### Diagnostics (manual retry)
+
+When the integration is stuck on hourly retries, notifications stay at `0 / 0`, or you see HTTP 500 / timetable HTML errors, use the device buttons or the service for an immediate attempt:
+
+- **InfoMentor run diagnostics** (button): full re-login with your stored credentials, clears auth/notification backoff timers, then runs a normal coordinator refresh. Check the log for lines starting with `Diagnostics poke:`.
+- **InfoMentor full refresh (clears schedule cache)** (button): same as above, plus clears the in-memory today/tomorrow schedule cache before refreshing (your logs will show `clear_cache=True`).
+- **Service** (automations, Developer tools): `infomentor.diagnostic_poke` with optional `clear_cache: true` (defaults to `false`). Target your InfoMentor device or pass `config_entry_id`.
+
+#### Viewing what the integration is doing (no SSH required)
+
+If Home Assistant runs in a VM and you don't want to tail `home-assistant.log`, you have three UI‑only options:
+
+- **InfoMentor Diagnostic Log** sensor — appears under the InfoMentor device. Its state shows the most recent event; open it in **Developer Tools → States** and you'll see the last ~50 events (`Session refresh OK`, `Hub warmup ok=true`, `Notification probe items=24`, etc.) as the `events` attribute.
+- **Download diagnostics** — on **Settings → Devices & services → InfoMentor**, click the three‑dot menu on the device and choose "Download diagnostics". You get a JSON bundle with pupil IDs, cookie counts per domain, the diagnostic event ring buffer, and the current notification buffer (credentials are redacted).
+- **Settings → System → Logs** — filter for `custom_components.infomentor` to see `WARNING`‑level lines including `Diagnostics poke: …`.
+
+### Push Notifications (InfoMentor App Replacement)
+
+The InfoMentor Android app has a known issue where it fails to register push notifications.  This integration provides a reliable alternative using Home Assistant's notification system.
+
+#### Setup
+1. Go to **Settings → Devices & Services → InfoMentor → Configure**
+2. In the "Notification services" field, enter comma-separated HA notify service names:
+   ```
+   mobile_app_andrews_phone, mobile_app_partner_phone
+   ```
+3. Save — the integration will now push new InfoMentor notices directly to those phones.
+
+#### What Gets Sent
+Each push notification includes:
+- **Title**: The notification title from InfoMentor (e.g. "Nytt inlägg i lärloggen")
+- **Message**: Notification type and date
+- **Tap action**: Opens the relevant InfoMentor page URL
+
+#### Supported Types
+LearnLog entries, CalendarV2 events (new + upcoming), News items, and all other types from the NotificationApp endpoint.
+
+#### Advanced: HA Event Automation
+Every new notification also fires an `infomentor_new_notification` event, which you can use in automations:
+
+```yaml
+automation:
+  - alias: "InfoMentor → custom push"
+    trigger:
+      - platform: event
+        event_type: infomentor_new_notification
+    action:
+      - service: notify.mobile_app_my_phone
+        data:
+          title: "{{ trigger.event.data.title }}"
+          message: "{{ trigger.event.data.pupil_name }} — {{ trigger.event.data.date_sent }}"
+          data:
+            url: "{{ trigger.event.data.url }}"
+            clickAction: "{{ trigger.event.data.url }}"
+```
 
 ### Debugging Authentication
 

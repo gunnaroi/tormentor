@@ -11,7 +11,8 @@ import asyncio
 from .auth import InfoMentorAuth, HUB_BASE_URL, MODERN_BASE_URL, DEFAULT_HEADERS
 from .models import (
 	NewsItem, TimelineEntry, PupilInfo, Assignment, AttendanceEntry,
-	TimetableEntry, TimeRegistrationEntry, ScheduleDay
+	TimetableEntry, TimeRegistrationEntry, ScheduleDay,
+	InfoMentorNotification,
 )
 from .exceptions import InfoMentorAPIError, InfoMentorConnectionError, InfoMentorDataError, InfoMentorAuthError
 
@@ -60,14 +61,24 @@ class InfoMentorClient:
 			raise InfoMentorAPIError("Client not properly initialised")
 			
 		self.authenticated = await self.auth.login(username, password)
+		if self.authenticated:
+			try:
+				await self.warmup_hub_session()
+			except Exception as err:
+				_LOGGER.debug("Post-login hub warmup failed: %s", err)
 		return self.authenticated
-	
+
 	async def try_restore_session(self) -> bool:
 		"""Attempt to reuse stored cookies instead of running a full login."""
 		if not self.auth:
 			raise InfoMentorAPIError("Client not properly initialised")
-		
+
 		self.authenticated = await self.auth.try_restore_session()
+		if self.authenticated:
+			try:
+				await self.warmup_hub_session()
+			except Exception as err:
+				_LOGGER.debug("Post-restore hub warmup failed: %s", err)
 		return self.authenticated
 		
 	async def get_pupil_ids(self) -> List[str]:
@@ -172,6 +183,164 @@ class InfoMentorClient:
 		except json.JSONDecodeError as e:
 			raise InfoMentorDataError(f"Failed to parse news data: {e}") from e
 			
+	async def warmup_hub_session(self) -> bool:
+		"""Replay the browser SPA warm-up calls so the hub server session is primed.
+
+		The hub APIs (timeline, notifications, etc.) return empty 200s, 500s or
+		HTML if we call them before the SPA has initialised "home". The real
+		browser sends a small sequence of GETs to bootstrap the server session
+		after login — we replicate the important ones here so subsequent API
+		calls don't get half-baked responses.
+
+		Returns True if the warm-up completed without errors.
+		"""
+		if not self._session or not self.authenticated:
+			return False
+
+		# (method, path) — InfoMentor's *App/*App/appData endpoints expect POST.
+		warmup_steps = [
+			("GET", "/"),
+			("GET", "/Account/ClearToHome"),
+			("POST", "/Home/Home/appData"),
+			("POST", "/NotificationApp/NotificationApp/appData"),
+			("GET", "/Authentication/Authentication/AccessibilityInfo"),
+		]
+
+		headers = DEFAULT_HEADERS.copy()
+		headers.update({
+			"Accept": "application/json, text/javascript, */*; q=0.01",
+			"X-Requested-With": "XMLHttpRequest",
+			"Referer": f"{HUB_BASE_URL}/",
+			"Origin": HUB_BASE_URL,
+		})
+
+		any_success = False
+		for method, path in warmup_steps:
+			url = f"{HUB_BASE_URL}{path}"
+			req = self._session.get if method == "GET" else self._session.post
+			try:
+				async with req(url, headers=headers, allow_redirects=True) as resp:
+					body = await resp.text()
+					_LOGGER.debug(
+						"Hub warmup %s %s -> %s (%d chars, ct=%s)",
+						method, path, resp.status, len(body),
+						resp.headers.get("content-type", ""),
+					)
+					if resp.status < 500:
+						any_success = True
+			except Exception as err:
+				_LOGGER.debug("Hub warmup %s %s failed: %s", method, path, err)
+
+		return any_success
+
+	async def get_notifications(self) -> List[InfoMentorNotification]:
+		"""Fetch notifications from the InfoMentor NotificationApp.
+
+		Returns all notifications for the current session (all pupils).
+
+		InfoMentor's hub returns:
+		  - HTTP 500 when the session is completely invalid
+		  - HTTP 200 with HTML when the cookie is present but expired
+		  - HTTP 200 with an empty body when the server-side SPA session hasn't
+		    been primed yet (no prior "home init" call)
+		  - HTTP 200 with JSON when everything is healthy
+
+		If we get an empty/HTML/500 response we run the hub warm-up and retry once.
+		"""
+		self._ensure_authenticated()
+
+		url = f"{HUB_BASE_URL}/NotificationApp/NotificationApp/appData"
+		headers = DEFAULT_HEADERS.copy()
+		headers.update({
+			"Accept": "application/json, text/javascript, */*; q=0.01",
+			"X-Requested-With": "XMLHttpRequest",
+			"Referer": f"{HUB_BASE_URL}/",
+			"Origin": HUB_BASE_URL,
+		})
+
+		async def _debug_dump(tag: str, status: int, content_type: str, text: str) -> None:
+			try:
+				import asyncio as _asyncio
+				path = f"/tmp/infomentor_notifications_{tag}.txt"
+				def _w():
+					with open(path, "w", encoding="utf-8") as f:
+						f.write(f"status={status}\ncontent-type={content_type}\n\n{text}")
+				await _asyncio.to_thread(_w)
+				_LOGGER.debug("Dumped notification response to %s", path)
+			except Exception as e:
+				_LOGGER.debug("Could not dump notification response: %s", e)
+
+		async def _do_request(method: str) -> Optional[List[InfoMentorNotification]]:
+			"""Return list on success, None if we should retry after warmup."""
+			request_fn = self._session.get if method == "GET" else self._session.post
+			try:
+				async with request_fn(url, headers=headers) as resp:
+					status = resp.status
+					content_type = resp.headers.get("content-type", "").lower()
+					text = await resp.text()
+
+					if status != 200:
+						_LOGGER.warning("Notification endpoint %s returned HTTP %s", method, status)
+						await _debug_dump(f"{method.lower()}_{status}", status, content_type, text)
+						return None
+
+					if "text/html" in content_type:
+						_LOGGER.warning("Notification endpoint %s returned HTML — session may have expired", method)
+						await _debug_dump(f"{method.lower()}_html", status, content_type, text)
+						return None
+
+					stripped = text.strip()
+					if not stripped:
+						_LOGGER.warning("Notification endpoint %s returned empty body (content-type=%s)", method, content_type)
+						await _debug_dump(f"{method.lower()}_empty", status, content_type, text)
+						return None
+
+					if not (stripped.startswith("{") or stripped.startswith("[")):
+						_LOGGER.warning("Notification endpoint %s returned non-JSON (%d chars)", method, len(text))
+						await _debug_dump(f"{method.lower()}_nonjson", status, content_type, text)
+						return None
+
+					try:
+						data = json.loads(stripped)
+					except json.JSONDecodeError as e:
+						_LOGGER.warning("Notification JSON parse failed (%s)", e)
+						await _debug_dump(f"{method.lower()}_jsonerr", status, content_type, text)
+						return None
+
+					raw_items = data.get("notifications", []) if isinstance(data, dict) else []
+					notifications: List[InfoMentorNotification] = []
+					for item in raw_items:
+						try:
+							notifications.append(InfoMentorNotification.from_dict(item))
+						except Exception as parse_err:
+							_LOGGER.debug("Failed to parse notification: %s", parse_err)
+
+					_LOGGER.debug("Fetched %d notifications via %s", len(notifications), method)
+					return notifications
+			except aiohttp.ClientError as e:
+				raise InfoMentorConnectionError(f"Connection error fetching notifications: {e}") from e
+
+		# InfoMentor's /NotificationApp/NotificationApp/appData endpoint currently
+		# requires POST; GET returns HTTP 500. We try POST first and fall back to
+		# GET + warm-up if the account happens to be one of the older variants.
+		result = await _do_request("POST")
+		if result is not None:
+			return result
+
+		_LOGGER.info("Notification POST failed; running hub warmup and trying GET fallback")
+		await self.warmup_hub_session()
+
+		result = await _do_request("POST")
+		if result is not None:
+			return result
+
+		result = await _do_request("GET")
+		if result is not None:
+			return result
+
+		_LOGGER.warning("Notification endpoint returned no usable data after warmup + POST/GET attempts")
+		return []
+
 	async def get_timeline(self, pupil_id: Optional[str] = None, page: int = 1, page_size: int = 50) -> List[TimelineEntry]:
 		"""Get timeline entries for a pupil.
 		
@@ -195,11 +364,26 @@ class InfoMentorClient:
 			"Accept": "application/json, text/javascript, */*; q=0.01",
 			"X-Requested-With": "XMLHttpRequest",
 			"Content-Length": "0",
+			"Referer": f"{HUB_BASE_URL}/",
+			"Origin": HUB_BASE_URL,
 		})
-		
-		async with self._session.post(app_data_url, headers=headers) as resp:
-			if resp.status != 200:
-				_LOGGER.warning(f"Failed to initialise timeline app data: HTTP {resp.status}")
+
+		async def _init_timeline() -> int:
+			async with self._session.post(app_data_url, headers=headers) as resp:
+				return resp.status
+
+		init_status = await _init_timeline()
+		if init_status != 200:
+			_LOGGER.warning("Failed to initialise timeline app data: HTTP %s; running hub warmup and retrying", init_status)
+			await self.warmup_hub_session()
+			if pupil_id:
+				try:
+					await self.switch_pupil(pupil_id)
+				except Exception as err:
+					_LOGGER.debug("Pupil switch during timeline retry failed: %s", err)
+			init_status = await _init_timeline()
+			if init_status != 200:
+				_LOGGER.warning("Timeline init still returned HTTP %s after warmup", init_status)
 		
 		# Get timeline entries
 		timeline_url = f"{HUB_BASE_URL}/GroupTimeline/GroupTimeline/GetGroupTimelineEntries"

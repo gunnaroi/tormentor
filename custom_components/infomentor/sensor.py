@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -25,6 +26,8 @@ from .const import (
 	SENSOR_HAS_SCHOOL_TOMORROW,
 	SENSOR_DASHBOARD,
 	SENSOR_DATA_FRESHNESS,
+	SENSOR_NOTIFICATIONS,
+	SENSOR_DIAGNOSTIC_LOG,
 	ATTR_PUPIL_ID,
 	ATTR_PUPIL_NAME,
 	ATTR_AUTHOR,
@@ -65,7 +68,15 @@ async def async_setup_entry(
 		
 		# Add a data freshness sensor
 		entities.append(InfoMentorDataFreshnessSensor(coordinator, config_entry))
-		
+
+		# Add a notifications sensor
+		entities.append(InfoMentorNotificationsSensor(coordinator, config_entry))
+
+		# Add the diagnostic log sensor (exposes recent integration events as
+		# attributes, viewable in Developer Tools → States, so users can see
+		# what's happening without SSHing into the HA host).
+		entities.append(InfoMentorDiagnosticLogSensor(coordinator, config_entry))
+
 		# Add sensors for each pupil
 		for pupil_id in coordinator.pupil_ids:
 			try:
@@ -1005,4 +1016,107 @@ class InfoMentorHasSchoolTomorrowSensor(InfoMentorPupilSensorBase):
 			if tomorrow_schedule.latest_end:
 				attributes[ATTR_LATEST_END] = tomorrow_schedule.latest_end.strftime('%H:%M')
 				
-		return attributes 
+		return attributes
+
+
+class InfoMentorNotificationsSensor(InfoMentorSensorBase):
+	"""Sensor showing InfoMentor notification count and details."""
+
+	def __init__(
+		self,
+		coordinator: InfoMentorDataUpdateCoordinator,
+		config_entry: ConfigEntry,
+	) -> None:
+		"""Initialise the sensor."""
+		super().__init__(coordinator, config_entry)
+		self._attr_name = "InfoMentor Notifications"
+		self._attr_unique_id = f"{config_entry.entry_id}_{SENSOR_NOTIFICATIONS}"
+		self._attr_icon = "mdi:bell-ring-outline"
+
+	@property
+	def native_value(self) -> str:
+		"""Return unread / total as a visible summary string."""
+		notifications = self.coordinator.notifications
+		total = len(notifications)
+		unread = sum(1 for n in notifications if n.is_new)
+		return f"{unread} / {total}"
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		"""Return notification details as attributes."""
+		notifications = self.coordinator.notifications
+		unread_list = [n for n in notifications if n.is_new]
+		total = len(notifications)
+		unread = len(unread_list)
+
+		attrs: Dict[str, Any] = {
+			"total_notifications": total,
+			"unread_notifications": unread,
+		}
+
+		if unread_list:
+			latest = unread_list[0]
+			attrs["latest_title"] = latest.title
+			attrs["latest_date"] = latest.date_sent.strftime("%Y-%m-%d %H:%M")
+			attrs["latest_type"] = latest.notification_type
+			attrs["latest_url"] = latest.full_url
+
+		items = []
+		for n in notifications[:20]:
+			items.append({
+				"id": n.id,
+				"title": n.title,
+				"date": n.date_sent.strftime("%Y-%m-%d %H:%M"),
+				"type": n.notification_type,
+				"state": n.state,
+				"url": n.full_url,
+				"app_type": n.app_type,
+			})
+		attrs["notifications"] = items
+
+		return attrs
+
+
+class InfoMentorDiagnosticLogSensor(InfoMentorSensorBase):
+	"""Sensor exposing recent InfoMentor diagnostic events.
+
+	The ``state`` shows the most recent event's message and the attributes
+	include the last ~50 events. This means users can inspect the integration
+	from Developer Tools → States in the HA UI without needing VM shell access.
+	"""
+
+	def __init__(
+		self,
+		coordinator: InfoMentorDataUpdateCoordinator,
+		config_entry: ConfigEntry,
+	) -> None:
+		"""Initialise the diagnostic log sensor."""
+		super().__init__(coordinator, config_entry)
+		self._attr_name = "InfoMentor Diagnostic Log"
+		self._attr_unique_id = f"{config_entry.entry_id}_{SENSOR_DIAGNOSTIC_LOG}"
+		self._attr_icon = "mdi:clipboard-text-clock-outline"
+		self._attr_entity_category = EntityCategory.DIAGNOSTIC
+
+	@property
+	def native_value(self) -> str:
+		"""Show the latest event summary as the sensor state."""
+		events = self.coordinator.diagnostic_events
+		if not events:
+			return "No events yet"
+		latest = events[-1]
+		msg = str(latest.get("message", "?"))
+		return msg[:255]
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		"""Return the rolling diagnostic event buffer."""
+		events = self.coordinator.diagnostic_events
+		attrs: Dict[str, Any] = {
+			"event_count": len(events),
+			"events": events[-50:],
+		}
+		if events:
+			attrs["latest_level"] = events[-1].get("level")
+			attrs["latest_ts"] = events[-1].get("ts")
+			attrs["latest_data"] = events[-1].get("data")
+		return attrs

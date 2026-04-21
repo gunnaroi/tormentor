@@ -274,13 +274,59 @@ This distinction is crucial for accurate child type detection.
 - **Assignment Tracking**: Homework and project monitoring
 - **Attendance Records**: Absence and tardiness tracking  
 - **Grade Information**: Academic progress (if API supports)
-- **Push Notifications**: Real-time updates via HA notifications
+- ~~**Push Notifications**: Real-time updates via HA notifications~~ — **Done (v1.7)**
 
 ### Technical Improvements
 - **Async Performance**: Further optimisation of API calls
 - **Caching Strategy**: Intelligent data caching for performance
 - **Multi-language**: Support for other InfoMentor regions
 - **Advanced Filtering**: Customisable data filtering options
+
+## Push Notifications (v1.7)
+
+The InfoMentor Android app has a known issue where push notification registration fails.  This integration provides a reliable alternative.
+
+### How It Works
+1. The coordinator polls `NotificationApp/NotificationApp/appData` every 5 minutes.
+2. New notifications fire the `infomentor_new_notification` HA event (title, date, type, pupil, URL).
+3. If notify services are configured in Options, push notifications are sent to the specified phones automatically.
+4. `sensor.infomentor_notifications` exposes the unread count and latest 20 notifications as attributes.
+
+### Configuration
+In **Settings → Devices & Services → InfoMentor → Configure**, enter comma-separated HA notify service names (e.g. `mobile_app_andrews_phone, mobile_app_partner_phone`).
+
+### Manual diagnostics (buttons + service)
+- Device buttons **Run diagnostics** and **Full refresh (clear cache)** call `InfoMentorDataUpdateCoordinator.async_diagnostic_poke()` — re-login, reset notification/auth backoff, then `async_refresh()`.
+- Service `infomentor.diagnostic_poke` with optional `clear_cache` for automations / Developer tools.
+
+### Files Involved
+| File | Responsibility |
+|------|---------------|
+| `models.py` | `InfoMentorNotification` dataclass with `from_dict()`, `is_new`, `full_url` |
+| `client.py` | `get_notifications()` fetches and parses the endpoint |
+| `coordinator.py` | Polls, tracks seen IDs, fires events, calls HA notify services |
+| `sensor.py` | `InfoMentorNotificationsSensor` — unread count + attributes |
+| `config_flow.py` | Options flow field for `notify_services` |
+| `const.py` | `NOTIFICATION_CHECK_INTERVAL_MINUTES`, `SENSOR_NOTIFICATIONS`, `EVENT_NEW_NOTIFICATION`, `CONF_NOTIFY_SERVICES`, button + `SERVICE_DIAGNOSTIC_POKE` |
+| `button.py` | Diagnostics / full-refresh buttons on the account device |
+| `services.py` | `diagnostic_poke` service handler |
+
+### Automation Example
+```yaml
+automation:
+  - alias: "InfoMentor notification → push"
+    trigger:
+      - platform: event
+        event_type: infomentor_new_notification
+    action:
+      - service: notify.mobile_app_my_phone
+        data:
+          title: "{{ trigger.event.data.title }}"
+          message: "{{ trigger.event.data.pupil_name }} — {{ trigger.event.data.date_sent }}"
+          data:
+            url: "{{ trigger.event.data.url }}"
+            clickAction: "{{ trigger.event.data.url }}"
+```
 
 ## Known Limitations
 
@@ -291,7 +337,7 @@ This distinction is crucial for accurate child type detection.
 
 ### Integration Limits
 - **Read-Only**: Cannot modify InfoMentor data from HA
-- **Polling-Based**: No real-time push notifications from InfoMentor
+- **Polling-Based**: Notification checks run every 5 minutes (not instant push)
 - **Session Limits**: May need periodic re-authentication
 
 ## Support & Documentation

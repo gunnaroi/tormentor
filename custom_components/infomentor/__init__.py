@@ -16,7 +16,7 @@ from .services import async_register_services, async_unregister_services
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.SENSOR]
 
 
 async def _cleanup_duplicate_entities_before_setup(hass: HomeAssistant, entry: ConfigEntry) -> None:

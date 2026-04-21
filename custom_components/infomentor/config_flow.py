@@ -12,7 +12,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .infomentor.exceptions import InfoMentorAuthError, InfoMentorConnectionError
 
-from .const import DOMAIN
+from .const import DOMAIN, CONF_NOTIFY_SERVICES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -133,29 +133,30 @@ class InfoMentorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 class InfoMentorOptionsFlow(config_entries.OptionsFlow):
 	"""Handle InfoMentor options."""
-	
+
 	def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
 		"""Initialise options flow."""
 		self.config_entry = config_entry
-		
+
 	async def async_step_init(
 		self, user_input: Optional[Dict[str, Any]] = None
 	) -> FlowResult:
-		"""Manage the options, allowing credentials update with validation."""
+		"""Manage options: credentials and notification settings."""
 		errors: Dict[str, str] = {}
 		current_username = self.config_entry.data.get(CONF_USERNAME, "")
-		
+		current_notify = self.config_entry.options.get(CONF_NOTIFY_SERVICES, "")
+
 		if user_input is not None:
 			username = user_input.get(CONF_USERNAME, current_username)
 			password = user_input.get(CONF_PASSWORD)
-			
-			# Require a password value
+			notify_services = user_input.get(CONF_NOTIFY_SERVICES, "")
+
 			if not password:
 				errors["base"] = "invalid_auth"
 			else:
-				# Test the new credentials
 				try:
 					session = async_get_clientsession(self.hass)
+					from .infomentor.client import InfoMentorClient
 					async with InfoMentorClient(session) as client:
 						await client.login(username, password)
 				except InfoMentorAuthError:
@@ -166,19 +167,23 @@ class InfoMentorOptionsFlow(config_entries.OptionsFlow):
 					_LOGGER.exception("Unexpected exception during credentials test in options")
 					errors["base"] = "unknown"
 				else:
-					# Update entry data with new credentials and reload entry
 					new_data = dict(self.config_entry.data)
 					new_data[CONF_USERNAME] = username
 					new_data[CONF_PASSWORD] = password
-					self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
+					self.hass.config_entries.async_update_entry(
+						self.config_entry,
+						data=new_data,
+						options={CONF_NOTIFY_SERVICES: notify_services},
+					)
 					await self.hass.config_entries.async_reload(self.config_entry.entry_id)
-					return self.async_create_entry(title="", data={})
-		
+					return self.async_create_entry(title="", data={CONF_NOTIFY_SERVICES: notify_services})
+
 		schema = vol.Schema({
 			vol.Required(CONF_USERNAME, default=current_username): str,
 			vol.Required(CONF_PASSWORD): str,
+			vol.Optional(CONF_NOTIFY_SERVICES, default=current_notify): str,
 		})
-		
+
 		return self.async_show_form(
 			step_id="init",
 			data_schema=schema,

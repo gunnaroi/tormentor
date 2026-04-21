@@ -23,7 +23,22 @@
 		"step": {
 			"init": {
 				"title": "InfoMentor Options",
-				"description": "Configure options for your InfoMentor integration."
+				"description": "Update credentials and configure push notifications. The InfoMentor Android app has a known issue with push notification registration — use this as an alternative!",
+				"data": {
+					"username": "Username/Email",
+					"password": "Password",
+					"notify_services": "Notification services (comma-separated, e.g. mobile_app_andrews_phone, mobile_app_partner_phone)"
+				}
+			}
+		}
+	},
+	"entity": {
+		"button": {
+			"diagnostics_refresh": {
+				"name": "Run diagnostics"
+			},
+			"diagnostics_full_refresh": {
+				"name": "Full refresh (clear cache)"
 			}
 		}
 	}

@@ -16,6 +16,7 @@ from .const import (
 	DOMAIN,
 	SERVICE_CLEANUP_DUPLICATES,
 	SERVICE_DEBUG_AUTH,
+	SERVICE_DIAGNOSTIC_POKE,
 	SERVICE_FORCE_REFRESH,
 	SERVICE_REFRESH_DATA,
 	SERVICE_RETRY_AUTH,
@@ -35,6 +36,7 @@ _REGISTERED_SERVICES = (
 	SERVICE_DEBUG_AUTH,
 	SERVICE_CLEANUP_DUPLICATES,
 	SERVICE_RETRY_AUTH,
+	SERVICE_DIAGNOSTIC_POKE,
 )
 
 
@@ -68,6 +70,10 @@ SERVICE_RETRY_AUTH_SCHEMA = _build_schema({
 	vol.Optional("clear_cache", default=False): bool,
 })
 
+SERVICE_DIAGNOSTIC_POKE_SCHEMA = _build_schema({
+	vol.Optional("clear_cache", default=False): bool,
+})
+
 
 async def async_register_services(hass: HomeAssistant) -> None:
 	"""Register InfoMentor services once per Home Assistant instance."""
@@ -94,6 +100,9 @@ async def async_register_services(hass: HomeAssistant) -> None:
 	
 	async def handle_retry_auth(call: ServiceCall) -> None:
 		await _run_for_targets(hass, call, _action_retry_auth)
+
+	async def handle_diagnostic_poke(call: ServiceCall) -> None:
+		await _run_for_targets(hass, call, _action_diagnostic_poke)
 	
 	hass.services.async_register(
 		DOMAIN,
@@ -135,6 +144,13 @@ async def async_register_services(hass: HomeAssistant) -> None:
 		SERVICE_RETRY_AUTH,
 		handle_retry_auth,
 		schema=SERVICE_RETRY_AUTH_SCHEMA,
+	)
+
+	hass.services.async_register(
+		DOMAIN,
+		SERVICE_DIAGNOSTIC_POKE,
+		handle_diagnostic_poke,
+		schema=SERVICE_DIAGNOSTIC_POKE_SCHEMA,
 	)
 	
 	_SERVICES_REGISTERED = True
@@ -323,6 +339,22 @@ async def _action_debug_auth(
 		coordinator.username,
 		entry_id,
 		debug_info,
+	)
+
+
+async def _action_diagnostic_poke(
+	entry_id: str,
+	coordinator: InfoMentorDataUpdateCoordinator,
+	call: ServiceCall,
+) -> None:
+	"""Re-login, bypass throttles, and refresh (same as the diagnostics buttons)."""
+	clear_cache = call.data.get("clear_cache", False)
+	await coordinator.async_diagnostic_poke(clear_cache=clear_cache)
+	_LOGGER.info(
+		"Service diagnostic_poke completed for account %s (entry=%s, clear_cache=%s)",
+		coordinator.username,
+		entry_id,
+		clear_cache,
 	)
 
 

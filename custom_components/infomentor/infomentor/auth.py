@@ -87,49 +87,82 @@ class SchoolOption:
 	number: Optional[str] = None
 
 
-async def _auto_submit_openid_form(session: aiohttp.ClientSession, html: str, referer: str) -> _FormSubmissionResult:
+def _has_openid_form(page_html: str) -> bool:
+	"""Check whether the HTML contains an OpenID/WS-Fed auto-submit form."""
+	return 'id="openid_message"' in page_html or "id='openid_message'" in page_html
+
+
+def _extract_openid_form_action(page_html: str, fallback_url: str) -> str:
+	"""Extract the action URL from an openid_message form, handling any attribute order."""
+	patterns = [
+		r'<form\b[^>]*\bid=["\']openid_message["\'][^>]*\baction=["\']([^"\']+)["\']',
+		r'<form\b[^>]*\baction=["\']([^"\']+)["\'][^>]*\bid=["\']openid_message["\']',
+	]
+	for pattern in patterns:
+		match = re.search(pattern, page_html, re.IGNORECASE)
+		if match:
+			return html.unescape(match.group(1))
+	return fallback_url
+
+
+async def _auto_submit_openid_form(session: aiohttp.ClientSession, page_html: str, referer: str) -> _FormSubmissionResult:
 	"""Detect and auto-submit OpenID/WS-Fed forms present in HTML.
+
+	Uses the robust extract_hidden_fields helper so attribute ordering inside
+	<input> tags does not matter.  Follows up to 5 chained auto-submit forms
+	(hub ↔ legacy ↔ hub round-trips).
 
 	Returns _FormSubmissionResult with executed flag and last response data.
 	"""
 	try:
-		import re as _re
-		if 'id="openid_message"' not in html and 'id=\'openid_message\'' not in html:
+		if not _has_openid_form(page_html):
 			return _FormSubmissionResult(False)
-		# Loop a few times in case of chained auto-submit forms
-		current_html = html
+
+		current_html = page_html
 		current_url = referer
-		for _ in range(3):
-			if 'id="openid_message"' not in current_html and 'id=\'openid_message\'' not in current_html:
+
+		for hop in range(5):
+			if not _has_openid_form(current_html):
 				break
-			# Extract form action
-			action_match = _re.search(r'<form[^>]*id=["\']openid_message["\'][^>]*action=["\']([^"\']+)["\']', current_html, _re.IGNORECASE)
-			action_url = action_match.group(1) if action_match else LEGACY_BASE_URL
-			# Normalise relative action
-			if action_url and not action_url.startswith('http'):
+
+			action_url = _extract_openid_form_action(current_html, LEGACY_BASE_URL)
+			if action_url and not action_url.startswith("http"):
 				action_url = _urljoin(current_url, action_url)
-			# Extract hidden inputs
-			inputs = {}
-			for name, value in _re.findall(r'<input[^>]*type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']', current_html, _re.IGNORECASE):
-				inputs[name] = value
-			# Post the form
+
+			fields = extract_hidden_fields(current_html)
+			inputs = {name: value for name, value in fields}
+
+			if not inputs:
+				_LOGGER.warning("OpenID form detected but contained no hidden fields")
+				break
+
+			parsed_action = urlparse(action_url)
+			origin = f"{parsed_action.scheme}://{parsed_action.netloc}" if parsed_action.scheme else None
+			parsed_current = urlparse(current_url)
+			same_origin = parsed_action.netloc == parsed_current.netloc
+
 			headers = DEFAULT_HEADERS.copy()
 			headers.update({
 				"Content-Type": "application/x-www-form-urlencoded",
-				"Origin": HUB_BASE_URL if "infomentor.se" not in action_url else "https://infomentor.se",
 				"Referer": current_url,
-				"Sec-Fetch-Site": "cross-site" if "hub.infomentor.se" in current_url and "infomentor.se" in action_url else "same-origin",
+				"Sec-Fetch-Site": "same-origin" if same_origin else "cross-site",
 				"Sec-Fetch-Dest": "document",
 			})
-			from urllib.parse import urlencode as _urlencode
+			if origin:
+				headers["Origin"] = origin
+
 			await asyncio.sleep(REQUEST_DELAY)
-			async with session.post(action_url, headers=headers, data=_urlencode(inputs), allow_redirects=True) as resp:
+			async with session.post(action_url, headers=headers, data=urlencode(fields), allow_redirects=True) as resp:
 				current_html = await resp.text()
 				current_url = str(resp.url)
-				_LOGGER.debug(f"Auto-submitted OpenID form to {action_url}; status={resp.status}, final_url={resp.url}")
+				_LOGGER.debug(
+					"OpenID auto-submit hop %d -> %s ; status=%s final_url=%s (%d chars)",
+					hop + 1, action_url, resp.status, resp.url, len(current_html),
+				)
+
 		return _FormSubmissionResult(True, current_url, current_html)
 	except Exception as e:
-		_LOGGER.debug(f"Auto-submit OpenID form handling failed: {e}")
+		_LOGGER.warning("Auto-submit OpenID form handling failed: %s", e)
 		return _FormSubmissionResult(False)
 
 
@@ -563,9 +596,9 @@ class InfoMentorAuth:
 		Returns:
 			True if authentication successful
 		"""
-		_LOGGER.error("*** LOGIN METHOD CALLED v0.0.53 *** username=%s", username)
+		_LOGGER.info("Login called for username=%s", username)
 		try:
-			_LOGGER.info("Starting InfoMentor OAuth authentication flow!!")
+			_LOGGER.info("Starting InfoMentor OAuth authentication flow")
 			# Store for potential reauthentication
 			self._username = username
 			self._password = password
@@ -581,30 +614,27 @@ class InfoMentorAuth:
 				except Exception as pref_err:
 					_LOGGER.debug(f"Could not apply stored IdP preference: {pref_err}")
 			
-			# Step 1: Get OAuth token (primary method, confirmed by user)
-			_LOGGER.error("*** STEP 1 STARTING - Getting OAuth token v0.0.53 ***")
+			# Step 1: Get OAuth token (primary method)
+			_LOGGER.info("Step 1: Getting OAuth token")
 			try:
 				oauth_token = await self._get_oauth_token()
-				_LOGGER.error(f"*** OAUTH TOKEN RESULT v0.0.53 *** token={oauth_token[:20] if oauth_token else 'None'}...")
-				
+				_LOGGER.info("OAuth token obtained: %s", bool(oauth_token))
+
 				if oauth_token:
-					_LOGGER.error("*** STEP 2 STARTING - OAuth completion v0.0.53 ***")
+					_LOGGER.info("Step 2: Completing OAuth flow")
 					await self._complete_oauth_to_modern_domain(oauth_token, username, password)
-					_LOGGER.error("*** STEP 2 COMPLETED v0.0.53 ***")
+					_LOGGER.info("Step 2 completed")
 				else:
-					_LOGGER.error("*** NO OAUTH TOKEN - Trying direct login fallback v0.0.53 ***")
+					_LOGGER.warning("No OAuth token — trying direct login fallback")
 					await self._direct_login_with_credentials(username, password)
 			except Exception as oauth_err:
-				_LOGGER.error(f"*** OAUTH FLOW FAILED v0.0.53 *** error={oauth_err}")
-				_LOGGER.error("*** FALLBACK - Trying direct login v0.0.53 ***")
-				
-				# Fallback to direct login if OAuth fails
+				_LOGGER.warning("OAuth flow failed (%s) — trying direct login fallback", oauth_err)
 				try:
 					await self._direct_login_with_credentials(username, password)
-					_LOGGER.error("*** DIRECT LOGIN FALLBACK COMPLETED v0.0.53 ***")
+					_LOGGER.info("Direct login fallback completed")
 				except Exception as fallback_err:
-					_LOGGER.error(f"*** ALL LOGIN METHODS FAILED v0.0.53 *** oauth_err={oauth_err}, fallback_err={fallback_err}")
-					raise oauth_err  # Prefer to show OAuth error since that's the primary method
+					_LOGGER.error("All login methods failed: oauth=%s, fallback=%s", oauth_err, fallback_err)
+					raise oauth_err
 			
 			# Step 3: Get pupil IDs from modern interface
 			_LOGGER.info("Step 3: Getting pupil IDs from dashboard")
@@ -630,16 +660,19 @@ class InfoMentorAuth:
 				
 				# Don't mark as authenticated if we have no pupil IDs
 				# This forces re-authentication on the next attempt
-				_LOGGER.error("*** AUTHENTICATION FAILED - NO PUPIL IDS FOUND v0.0.40 ***")
+				_LOGGER.error("Authentication failed — no pupil IDs found")
 				self.authenticated = False
 				raise InfoMentorAuthError("Authentication failed - no pupil IDs found")
 			else:
-				_LOGGER.info(f"*** AUTHENTICATION SUCCESS v0.0.40 *** - {len(self.pupil_ids)} pupils")
+				_LOGGER.info("Authentication success — %d pupils found", len(self.pupil_ids))
 				# Mark as authenticated and track timing
 				self.authenticated = True
 				import time
 				self._last_auth_time = time.time()
-				
+
+				# Establish sessions on all domains so API calls work
+				await self._establish_cross_domain_sessions()
+
 				# Backup authentication cookies for potential restoration
 				self._backup_auth_cookies()
 				if self.storage and self._auth_cookies_backup:
@@ -647,10 +680,10 @@ class InfoMentorAuth:
 						await self.storage.save_auth_cookies(self._auth_cookies_backup)
 					except Exception as cookie_err:
 						_LOGGER.debug(f"Could not persist auth cookies: {cookie_err}")
-			
+
 			_LOGGER.info("Authentication completed successfully")
 			return True
-			
+
 		except InfoMentorAuthError:
 			# Re-raise authentication errors as-is
 			raise
@@ -676,7 +709,7 @@ class InfoMentorAuth:
 			last_url = str(resp.url)
 			_LOGGER.debug(f"Login page status={resp.status}, url={last_url}")
 		# Handle auto-submit if present
-		if ('id="openid_message"' in last_text) or ('id=\'openid_message\'' in last_text):
+		if _has_openid_form(last_text):
 			_LOGGER.debug("Auto-submit form detected on login page; submitting...")
 			result = await _auto_submit_openid_form(self.session, last_text, referer=last_url)
 			if result.executed:
@@ -720,7 +753,7 @@ class InfoMentorAuth:
 				oauth_token = None
 				
 				# First check if we got an auto-submit form with OAuth token
-				if 'id="openid_message"' in text:
+				if _has_openid_form(text):
 					_LOGGER.info("Found auto-submit form in initial response")
 					# Extract OAuth token from hidden input
 					oauth_match = re.search(r'<input[^>]*name=["\']oauth_token["\'][^>]*value=["\']([^"\']+)["\']', text, re.IGNORECASE)
@@ -763,9 +796,8 @@ class InfoMentorAuth:
 	async def _complete_oauth_to_modern_domain(self, oauth_token: str, username: str, password: str) -> None:
 		"""Complete OAuth flow with improved LoginCallback handling."""
 		try:
-			_LOGGER.error("*** STARTING ENHANCED OAUTH COMPLETION v0.0.53 ***")
-			
-			# Stage 1: Submit initial OAuth token to get credential form
+			_LOGGER.info("Starting OAuth completion: posting token to legacy portal")
+
 			headers = DEFAULT_HEADERS.copy()
 			headers.update({
 				"Content-Type": "application/x-www-form-urlencoded",
@@ -774,74 +806,56 @@ class InfoMentorAuth:
 				"Sec-Fetch-Site": "cross-site",
 				"Sec-Fetch-Dest": "document",
 			})
-			
+
 			oauth_data = f"oauth_token={oauth_token}"
-			_LOGGER.error(f"*** POSTING OAUTH TOKEN v0.0.53 *** to {LEGACY_BASE_URL}")
-			
-			await asyncio.sleep(REQUEST_DELAY)  # Be respectful to the server
+
+			await asyncio.sleep(REQUEST_DELAY)
 			async with self.session.post(
 				LEGACY_BASE_URL,
 				headers=headers,
 				data=oauth_data,
-				allow_redirects=True
+				allow_redirects=True,
 			) as resp:
 				stage1_text = await resp.text()
-				_LOGGER.error(f"*** STAGE 1 RESPONSE v0.0.53 *** status={resp.status} url={resp.url}")
-				_LOGGER.error(f"*** STAGE 1 LENGTH v0.0.53 *** {len(stage1_text)} chars")
-				
-				# Save stage 1 response for debugging
+				_LOGGER.info("Stage 1 response: status=%s url=%s (%d chars)", resp.status, resp.url, len(stage1_text))
+
 				await _write_text_file_async(DEBUG_FILE_OAUTH, stage1_text)
-				_LOGGER.error(f"*** SAVED OAUTH DEBUG FILE v0.0.53 *** {DEBUG_FILE_OAUTH}")
-				
-				# Check if we already got a LoginCallback redirect
+
 				if "LoginCallback" in str(resp.url):
-					_LOGGER.error("*** RECEIVED EARLY LOGINCALLBACK v0.0.53 ***")
+					_LOGGER.info("Received early LoginCallback")
 					await self._handle_login_callback(str(resp.url), stage1_text)
 					return
 			
 			# Some flows render auto-submit form here; handle it
-			if ('id="openid_message"' in stage1_text) or ('id=\'openid_message\'' in stage1_text):
+			if _has_openid_form(stage1_text):
 				_LOGGER.info("Detected auto-submit form during stage 1; submitting...")
 				result = await _auto_submit_openid_form(self.session, stage1_text, referer=str(resp.url))
 				if result.executed:
 					stage1_text = result.final_text or stage1_text
 					_LOGGER.info("Stage 1 auto-submit form completed")
-					
-					# Check if auto-submit led to LoginCallback
 					if result.final_url and "LoginCallback" in result.final_url:
-						_LOGGER.error("*** AUTO-SUBMIT LED TO LOGINCALLBACK v0.0.53 ***")
 						await self._handle_login_callback(result.final_url, stage1_text)
 						return
 				else:
-					_LOGGER.error("Stage 1 auto-submit form failed")
-			
-			# Check if we have a school selection form (contains IdpListRepeater fields)
-			# Note: We don't need to "select" a school by navigating to a URL
-			# Instead, we submit ALL the school fields along with credentials in one POST
-			# InfoMentor will route us to the correct school based on our username/password
-			_LOGGER.info(f"*** CHECKING FOR SCHOOL FORM FIELDS v0.0.98 *** IdpListRepeater: {'IdpListRepeater' in stage1_text}")
+					_LOGGER.warning("Stage 1 auto-submit form failed")
+
 			if "IdpListRepeater" in stage1_text:
-				_LOGGER.info("*** DETECTED SCHOOL SELECTION FIELDS IN FORM v0.0.98 *** (will submit all fields with credentials)")
-			else:
-				_LOGGER.info("*** NO SCHOOL SELECTION FIELDS v0.0.98 ***")
-			
-			# Check if we need to submit credentials
+				_LOGGER.debug("School selection fields present in form (will be submitted with credentials)")
+
 			login_form = self._select_login_form(stage1_text)
-			_LOGGER.error(f"*** CHECKING FOR CREDENTIAL FORM v0.0.99 *** found={bool(login_form)}")
+			_LOGGER.info("Credential form found: %s", bool(login_form))
 			if login_form:
-				_LOGGER.error("*** FOUND CREDENTIAL FORM - SUBMITTING v0.0.99 ***")
 				await self._submit_credentials_and_handle_second_oauth(stage1_text, username, password, str(resp.url))
-				_LOGGER.error("*** CREDENTIAL SUBMISSION COMPLETED v0.0.99 ***")
+				_LOGGER.info("Credential submission completed")
 			else:
-				_LOGGER.error("*** NO CREDENTIAL FORM FOUND v0.0.99 ***")
-				_LOGGER.error(f"*** STAGE 1 SNIPPET v0.0.99 *** {stage1_text[:500]}...")
+				_LOGGER.warning("No credential form found in stage 1 response (%d chars)", len(stage1_text))
 		except Exception as oauth_completion_err:
-			_LOGGER.error(f"*** OAUTH COMPLETION EXCEPTION v0.0.53 *** {oauth_completion_err}")
+			_LOGGER.error("OAuth completion failed: %s", oauth_completion_err)
 			raise
 	
 	async def _handle_login_callback(self, callback_url: str, response_text: str) -> None:
 		"""Handle LoginCallback URL with oauth_token and oauth_verifier."""
-		_LOGGER.error(f"*** HANDLING LOGINCALLBACK v0.0.53 *** {callback_url}")
+		_LOGGER.debug(f"*** HANDLING LOGINCALLBACK v0.0.53 *** {callback_url}")
 		
 		# Parse the callback URL to extract OAuth parameters
 		parsed_url = urlparse(callback_url)
@@ -850,29 +864,29 @@ class InfoMentorAuth:
 		oauth_token = query_params.get('oauth_token', [None])[0]
 		oauth_verifier = query_params.get('oauth_verifier', [None])[0]
 		
-		_LOGGER.error(f"*** CALLBACK OAUTH TOKEN v0.0.53 *** {oauth_token[:20] if oauth_token else 'None'}...")
-		_LOGGER.error(f"*** CALLBACK OAUTH VERIFIER v0.0.53 *** {oauth_verifier[:20] if oauth_verifier else 'None'}...")
+		_LOGGER.debug(f"*** CALLBACK OAUTH TOKEN v0.0.53 *** {oauth_token[:20] if oauth_token else 'None'}...")
+		_LOGGER.debug(f"*** CALLBACK OAUTH VERIFIER v0.0.53 *** {oauth_verifier[:20] if oauth_verifier else 'None'}...")
 		
 		if not oauth_token or not oauth_verifier:
-			_LOGGER.error("*** INCOMPLETE OAUTH CALLBACK - MISSING TOKEN OR VERIFIER v0.0.53 ***")
+			_LOGGER.warning("*** INCOMPLETE OAUTH CALLBACK - MISSING TOKEN OR VERIFIER v0.0.53 ***")
 			return
 		
 		# Save the callback response for debugging
 		await _write_text_file_async("/tmp/infomentor_oauth_callback.html", response_text)
-		_LOGGER.error("*** SAVED OAUTH CALLBACK DEBUG FILE v0.0.53 ***")
+		_LOGGER.debug("*** SAVED OAUTH CALLBACK DEBUG FILE v0.0.53 ***")
 		
 		# Check if the callback response already contains pupil data
 		if any(indicator in response_text.lower() for indicator in ['pupil', 'elev', 'student', 'dashboard']):
-			_LOGGER.error("*** CALLBACK CONTAINS PUPIL DATA v0.0.53 ***")
+			_LOGGER.debug("*** CALLBACK CONTAINS PUPIL DATA v0.0.53 ***")
 		else:
-			_LOGGER.error("*** CALLBACK REQUIRES ADDITIONAL PROCESSING v0.0.53 ***")
+			_LOGGER.debug("*** CALLBACK REQUIRES ADDITIONAL PROCESSING v0.0.53 ***")
 			
 			# Try to navigate to the dashboard using the callback parameters
 			await self._navigate_to_dashboard_with_oauth_params(oauth_token, oauth_verifier)
 	
 	async def _navigate_to_dashboard_with_oauth_params(self, oauth_token: str, oauth_verifier: str) -> None:
 		"""Navigate to dashboard using OAuth token and verifier."""
-		_LOGGER.error("*** NAVIGATING TO DASHBOARD WITH OAUTH PARAMS v0.0.53 ***")
+		_LOGGER.debug("*** NAVIGATING TO DASHBOARD WITH OAUTH PARAMS v0.0.53 ***")
 		
 		# Common dashboard URLs to try
 		dashboard_urls = [
@@ -886,24 +900,24 @@ class InfoMentorAuth:
 		
 		for dashboard_url in dashboard_urls:
 			try:
-				_LOGGER.error(f"*** TRYING DASHBOARD URL v0.0.53 *** {dashboard_url}")
+				_LOGGER.debug(f"*** TRYING DASHBOARD URL v0.0.53 *** {dashboard_url}")
 				async with self.session.get(dashboard_url, headers=headers, allow_redirects=True) as resp:
 					dashboard_text = await resp.text()
-					_LOGGER.error(f"*** DASHBOARD RESPONSE v0.0.53 *** {resp.status} -> {resp.url}")
+					_LOGGER.debug(f"*** DASHBOARD RESPONSE v0.0.53 *** {resp.status} -> {resp.url}")
 					
 					# Check if this contains pupil data
 					if any(indicator in dashboard_text.lower() for indicator in ['pupil', 'elev', 'student']):
-						_LOGGER.error("*** FOUND PUPIL DATA IN DASHBOARD v0.0.53 ***")
+						_LOGGER.debug("*** FOUND PUPIL DATA IN DASHBOARD v0.0.53 ***")
 						await _write_text_file_async("/tmp/infomentor_oauth_dashboard.html", dashboard_text)
 						break
 					elif "login" in dashboard_text.lower() or "authentication" in dashboard_text.lower():
-						_LOGGER.error("*** DASHBOARD REQUIRES ADDITIONAL AUTH v0.0.53 ***")
+						_LOGGER.debug("*** DASHBOARD REQUIRES ADDITIONAL AUTH v0.0.53 ***")
 						continue
 					else:
-						_LOGGER.error("*** DASHBOARD STATUS UNCLEAR v0.0.53 ***")
+						_LOGGER.debug("*** DASHBOARD STATUS UNCLEAR v0.0.53 ***")
 						
 			except Exception as e:
-				_LOGGER.error(f"*** DASHBOARD NAVIGATION ERROR v0.0.53 *** {e}")
+				_LOGGER.warning(f"*** DASHBOARD NAVIGATION ERROR v0.0.53 *** {e}")
 				continue
 	
 	async def _submit_credentials_and_handle_second_oauth(self, form_html: str, username: str, password: str, form_url: str) -> None:
@@ -928,8 +942,7 @@ class InfoMentorAuth:
 				_LOGGER.debug(f"Refreshing login page failed: {refresh_err}")
 
 		if not login_form:
-			_LOGGER.error("*** NO LOGIN FORM FOUND v0.0.99 ***")
-			_LOGGER.error(f"*** LOGIN FORM SNIPPET v0.0.99 *** {used_html[:500]}...")
+			_LOGGER.warning("Could not locate login form for credential submission (%d chars)", len(used_html))
 			raise InfoMentorAuthError("Could not locate login form for credential submission")
 
 		form_action_url = self._resolve_form_action(used_url, login_form.action)
@@ -964,8 +977,7 @@ class InfoMentorAuth:
 		assert isinstance(form_fields, list)
 
 		if not username_field or not password_field:
-			_LOGGER.error("*** LOGIN FIELD DETECTION FAILED v0.0.99 ***")
-			_LOGGER.error(f"*** FORM ACTION v0.0.99 *** {form_action_url}")
+			_LOGGER.warning("Could not identify username/password fields in login form at %s", form_action_url)
 			raise InfoMentorAuthError("Could not identify username/password fields in login form")
 
 		_LOGGER.info(f"Extracted {len(form_fields)} form fields (including non-hidden fields)")
@@ -983,118 +995,110 @@ class InfoMentorAuth:
 			form_fields,
 			used_url,
 		)
-		_LOGGER.error(f"*** CREDENTIALS RESPONSE v0.0.99 *** status={status} url={final_url}")
+		_LOGGER.info("Credential submission response: status=%s url=%s", status, final_url)
 
-		# Check if credentials led to LoginCallback
 		if "LoginCallback" in final_url:
-			_LOGGER.error("*** CREDENTIALS LED TO LOGINCALLBACK v0.0.99 ***")
+			_LOGGER.info("Credentials led to LoginCallback")
 			await self._handle_login_callback(final_url, cred_text)
 			return
 
 		# Check for credential rejection first
 		if self._select_login_form(cred_text):
-			_LOGGER.error("Credentials appear to have been rejected")
-			try:
-				_LOGGER.error(f"Credentials rejection response (truncated): {cred_text[:500]}...")
-			except Exception:
-				pass
+			_LOGGER.warning("Credentials appear to have been rejected — login form still present")
 			raise InfoMentorAuthError("Invalid credentials - login form still present after submission")
 
-		# Look for second OAuth token in the response
+		# --- Critical step: detect WS-Fed / OpenID auto-submit form ---
+		# A real browser would auto-submit this form back to the hub callback,
+		# carrying wresult/wa/wctx/oauth_token fields that establish the hub session.
+		if _has_openid_form(cred_text):
+			_LOGGER.info("Credential response contains OpenID auto-submit form — following it back to hub")
+			result = await _auto_submit_openid_form(self.session, cred_text, referer=final_url)
+			if result.executed:
+				_LOGGER.info("OpenID auto-submit after credentials completed; final_url=%s", result.final_url)
+				if result.final_url and "LoginCallback" in result.final_url:
+					await self._handle_login_callback(result.final_url, result.final_text or "")
+				return
+			_LOGGER.warning("OpenID auto-submit after credentials did not execute — falling through")
+
+		# Fallback: look for a bare oauth_token hidden field (older flow)
 		second_oauth_match = re.search(r'oauth_token"\s+value="([\w+=/]+)"', cred_text)
 		if second_oauth_match:
 			second_oauth_token = second_oauth_match.group(1)
-			_LOGGER.error(f"*** FOUND SECOND OAUTH TOKEN v0.0.99 *** {second_oauth_token[:10]}...")
+			_LOGGER.info("Found second OAuth token (fallback path) — submitting")
 			await self._submit_second_oauth_token(second_oauth_token)
 		else:
-			_LOGGER.error("*** NO SECOND OAUTH TOKEN v0.0.99 *** - checking authentication state")
-
 			success_indicators = [
 				"default.aspx" in final_url.lower(),
 				"hub.infomentor.se" in final_url.lower(),
 				"logout" in cred_text.lower(),
 				"dashboard" in cred_text.lower(),
 			]
-
 			if any(success_indicators):
-				_LOGGER.error("*** CREDENTIALS ACCEPTED WITHOUT SECOND OAUTH v0.0.99 ***")
+				_LOGGER.info("Credentials accepted without second OAuth token")
 			else:
-				_LOGGER.error("*** UNCLEAR AUTHENTICATION STATE v0.0.99 ***")
+				_LOGGER.warning("Post-credential authentication state unclear")
 	
 	async def _submit_second_oauth_token(self, oauth_token: str) -> None:
-		"""Submit the second OAuth token to complete authentication."""
-		_LOGGER.debug("Submitting second OAuth token")
-		
+		"""Submit the second OAuth token to complete authentication.
+
+		Posts the token to the legacy portal.  If the response is another
+		OpenID auto-submit form (pointing back to the hub), follow it so
+		the hub session is properly established.
+		"""
+		_LOGGER.info("Submitting second OAuth token to legacy portal")
+
 		headers = DEFAULT_HEADERS.copy()
 		headers.update({
 			"Content-Type": "application/x-www-form-urlencoded",
-			"Origin": HUB_BASE_URL,
-			"Referer": f"{HUB_BASE_URL}/authentication/authentication/login?apitype=im1&forceOAuth=true",
-			"Sec-Fetch-Site": "same-site",
+			"Origin": "https://infomentor.se",
+			"Referer": LEGACY_BASE_URL,
+			"Sec-Fetch-Site": "same-origin",
 			"Sec-Fetch-Dest": "document",
 		})
-		
+
 		oauth_data = f"oauth_token={oauth_token}"
-		
+
 		async with self.session.post(
 			LEGACY_BASE_URL,
 			headers=headers,
 			data=oauth_data,
-			allow_redirects=True
+			allow_redirects=True,
 		) as resp:
 			final_text = await resp.text()
-			_LOGGER.error(f"*** SECOND OAUTH RESPONSE v0.0.53 *** {resp.status}, URL: {resp.url}")
-			
-			# Check if second OAuth led to LoginCallback
-			if "LoginCallback" in str(resp.url):
-				_LOGGER.error("*** SECOND OAUTH LED TO LOGINCALLBACK v0.0.53 ***")
-				await self._handle_login_callback(str(resp.url), final_text)
+			resp_url = str(resp.url)
+			_LOGGER.info("Second OAuth response: status=%s url=%s (%d chars)", resp.status, resp_url, len(final_text))
+
+			if "LoginCallback" in resp_url:
+				await self._handle_login_callback(resp_url, final_text)
 				return
-			
-			# More robust authentication verification
-			auth_success_indicators = [
-				"default.aspx" in str(resp.url).lower(),  # Successfully redirected to main page
-				"hub.infomentor.se" in str(resp.url),  # Redirected to hub
-				"dashboard" in final_text.lower(),
-				"logout" in final_text.lower(),
-				"pupil" in final_text.lower(),
-				"elev" in final_text.lower()
-			]
-			
-			auth_failure_indicators = [
-				"login_ascx" in final_text.lower(),
-				"txtnotandanafn" in final_text.lower(),
-				"txtlykilord" in final_text.lower(),
-				"invalid" in final_text.lower(),
-				"fel" in final_text.lower()  # Swedish for "error"
-			]
-			
-			# Check for positive indicators first
-			if any(auth_success_indicators):
-				_LOGGER.debug("Two-stage OAuth completed successfully - found success indicators")
-				# Touch modern root to ensure cookies are set on modern domain too
-				try:
-					headers2 = DEFAULT_HEADERS.copy()
-					headers2["Referer"] = f"{HUB_BASE_URL}/"
-					async with self.session.get(f"{MODERN_BASE_URL}/", headers=headers2, allow_redirects=True) as modern_resp:
-						_LOGGER.debug(f"Touched modern root, status={modern_resp.status}")
-				except Exception as e_touch:
-					_LOGGER.debug(f"Touching modern root failed: {e_touch}")
-				return
-			
-			# Check for negative indicators
-			if any(auth_failure_indicators):
-				_LOGGER.warning("Two-stage OAuth may not have completed fully - found failure indicators")
-				# Log a truncated snippet to aid debugging
-				try:
-					_LOGGER.warning(f"Second OAuth response (truncated): {final_text[:500]}...")
-				except Exception:
-					pass
-				# Try to verify by making a test request to the hub
-				await self._verify_authentication_status()
-			else:
-				_LOGGER.debug("Two-stage OAuth status unclear - attempting verification")
-				await self._verify_authentication_status()
+
+			# If the response is an OpenID form heading back to the hub, follow it
+			if _has_openid_form(final_text):
+				_LOGGER.info("Second OAuth returned OpenID form — auto-submitting back to hub")
+				result = await _auto_submit_openid_form(self.session, final_text, referer=resp_url)
+				if result.executed:
+					_LOGGER.info("Hub round-trip completed; final_url=%s", result.final_url)
+					if result.final_url and "LoginCallback" in result.final_url:
+						await self._handle_login_callback(result.final_url, result.final_text or "")
+					return
+
+			# Touch the hub root to propagate cookies across domains
+			try:
+				hub_headers = DEFAULT_HEADERS.copy()
+				hub_headers["Referer"] = resp_url
+				async with self.session.get(f"{HUB_BASE_URL}/", headers=hub_headers, allow_redirects=True) as hub_resp:
+					hub_text = await hub_resp.text()
+					# If the hub root itself is an auto-submit form, follow it too
+					if _has_openid_form(hub_text):
+						result = await _auto_submit_openid_form(self.session, hub_text, referer=str(hub_resp.url))
+						if result.executed:
+							_LOGGER.info("Hub root auto-submit completed; final_url=%s", result.final_url)
+					else:
+						_LOGGER.debug("Touched hub root, status=%s (%d chars)", hub_resp.status, len(hub_text))
+			except Exception as e_touch:
+				_LOGGER.debug("Touching hub root failed: %s", e_touch)
+
+			await self._verify_authentication_status()
 	
 	def _apply_last_used_idp_cookie(self, school_number: Optional[str]) -> None:
 		"""Mirror browser behaviour by persisting the last IdP selection cookie."""
@@ -1136,11 +1140,11 @@ class InfoMentorAuth:
 		url_pattern = r'<input[^>]*name=["\']login_ascx\$IdpListRepeater\$ctl(\d+)\$url["\'][^>]*value=["\']([^"\']*)["\']'
 		url_matches = _re.findall(url_pattern, html, _re.IGNORECASE)
 		
-		_LOGGER.error(f"*** FOUND {len(url_matches)} SCHOOL OPTIONS v0.0.76 ***")
+		_LOGGER.debug(f"*** FOUND {len(url_matches)} SCHOOL OPTIONS v0.0.76 ***")
 		
 		# Save school selection page for debugging
 		await _write_text_file_async("/tmp/infomentor_school_selection.html", html)
-		_LOGGER.error("*** SAVED SCHOOL SELECTION PAGE v0.0.76 *** /tmp/infomentor_school_selection.html")
+		_LOGGER.debug("*** SAVED SCHOOL SELECTION PAGE v0.0.76 *** /tmp/infomentor_school_selection.html")
 		
 		# Log all available schools for debugging
 		school_options: List[SchoolOption] = []
@@ -1157,7 +1161,7 @@ class InfoMentorAuth:
 				school_number = html_module.unescape(number_match.group(1).strip()) if number_match else None
 				option = SchoolOption(title=title, url=decoded_url, number=school_number)
 				school_options.append(option)
-				_LOGGER.error(f"*** AVAILABLE SCHOOL v0.0.90 *** [{control_id}] #{school_number or 'n/a'}: '{title}' -> {decoded_url}")
+				_LOGGER.debug(f"*** AVAILABLE SCHOOL v0.0.90 *** [{control_id}] #{school_number or 'n/a'}: '{title}' -> {decoded_url}")
 		
 		selected_option, scored_options = _choose_best_school_option(
 			school_options,
@@ -1169,7 +1173,7 @@ class InfoMentorAuth:
 		
 		if scored_options:
 			for rank, (title, url, score, order, number) in enumerate(scored_options[:5], start=1):
-				_LOGGER.error(
+				_LOGGER.debug(
 					f"*** SCHOOL SCORECARD v0.0.90 *** rank={rank} score={score} order={order} "
 					f"number={number} '{title}' -> {url}"
 				)
@@ -1181,7 +1185,7 @@ class InfoMentorAuth:
 		school_name = selected_option.title
 		school_url = selected_option.url
 		school_number = selected_option.number
-		_LOGGER.info(f"*** CHOSEN SCHOOL v0.0.90 *** {school_name} -> {school_url}")
+		_LOGGER.debug(f"*** CHOSEN SCHOOL v0.0.90 *** {school_name} -> {school_url}")
 		if school_number:
 			self._preferred_school_number = school_number
 			self._apply_last_used_idp_cookie(school_number)
@@ -1201,18 +1205,18 @@ class InfoMentorAuth:
 		
 		try:
 			await asyncio.sleep(REQUEST_DELAY)
-			_LOGGER.error(f"*** ATTEMPTING SCHOOL SELECTION v0.0.75 *** {school_name} -> {school_url}")
+			_LOGGER.debug(f"*** ATTEMPTING SCHOOL SELECTION v0.0.75 *** {school_name} -> {school_url}")
 			
 			# Try with a shorter timeout and better error handling
 			timeout = aiohttp.ClientTimeout(total=10)
 			async with self.session.get(school_url, headers=headers, allow_redirects=True, timeout=timeout) as resp:
-				_LOGGER.error(f"*** SCHOOL SELECTION SUCCESS v0.0.75 *** {resp.status} -> {resp.url}")
+				_LOGGER.debug(f"*** SCHOOL SELECTION SUCCESS v0.0.75 *** {resp.status} -> {resp.url}")
 				selection_text = await resp.text()
 				
 				# Handle authentication method selection page immediately
-				_LOGGER.error(f"*** AUTH METHOD CHECK v0.0.47 *** chooseAuthmech: {'chooseAuthmech' in str(resp.url)}")
-				_LOGGER.error(f"*** PAGE CONTENT SAMPLE v0.0.47 *** {selection_text[:1000]}...")
-				_LOGGER.error(f"*** PAGE CONTENT LENGTH v0.0.47 *** {len(selection_text)} chars")
+				_LOGGER.debug(f"*** AUTH METHOD CHECK v0.0.47 *** chooseAuthmech: {'chooseAuthmech' in str(resp.url)}")
+				_LOGGER.debug(f"*** PAGE CONTENT SAMPLE v0.0.47 *** {selection_text[:1000]}...")
+				_LOGGER.debug(f"*** PAGE CONTENT LENGTH v0.0.47 *** {len(selection_text)} chars")
 				
 				# Check for multiple possible authentication method texts in the complete content
 				auth_method_indicators = [
@@ -1232,40 +1236,40 @@ class InfoMentorAuth:
 				]
 				
 				found_indicators = [indicator for indicator in auth_method_indicators if indicator in selection_text]
-				_LOGGER.error(f"*** FOUND AUTH INDICATORS v0.0.48 *** {found_indicators}")
+				_LOGGER.debug(f"*** FOUND AUTH INDICATORS v0.0.48 *** {found_indicators}")
 				
 				# Check for password option with HTML entities and encodings
 				password_indicators = ["Lösenord", "Password", "L%C3%B6senord", "L&#246;senord", "L&#37;c3&#37;b6senord", "lösenord", "password"]
 				has_password_option = any(indicator in selection_text for indicator in password_indicators)
-				_LOGGER.error(f"*** PASSWORD OPTION CHECK v0.0.48 *** {has_password_option}")
+				_LOGGER.debug(f"*** PASSWORD OPTION CHECK v0.0.48 *** {has_password_option}")
 				
 				if "chooseAuthmech" in str(resp.url):
 					if has_password_option:
-						_LOGGER.error("*** DETECTED AUTH METHOD SELECTION v0.0.47 ***")
+						_LOGGER.debug("*** DETECTED AUTH METHOD SELECTION v0.0.47 ***")
 						await self._handle_auth_method_selection(selection_text, str(resp.url))
 					else:
 						# Fallback: Try to construct password URL from URL parameters
-						_LOGGER.error("*** NO PASSWORD IN CONTENT - TRYING URL FALLBACK v0.0.47 ***")
+						_LOGGER.debug("*** NO PASSWORD IN CONTENT - TRYING URL FALLBACK v0.0.47 ***")
 						if "L%C3%B6senord" in str(resp.url):
 							await self._handle_auth_method_fallback(str(resp.url))
 					# Note: Don't return here, let the flow continue to check for more redirects
-				elif 'id="openid_message"' in selection_text:
-					_LOGGER.error("*** SCHOOL RETURNED AUTO-SUBMIT FORM v0.0.43 ***")
+				elif _has_openid_form(selection_text):
+					_LOGGER.info("School returned auto-submit form")
 					form_result = await _auto_submit_openid_form(self.session, selection_text, str(resp.url))
 					if form_result.executed:
-						_LOGGER.error("*** SCHOOL AUTO-SUBMIT COMPLETED v0.0.43 ***")
+						_LOGGER.debug("*** SCHOOL AUTO-SUBMIT COMPLETED v0.0.43 ***")
 					
 		except Exception as e:
-			_LOGGER.error(f"*** SCHOOL SELECTION FAILED v0.0.43 *** {e}")
-			_LOGGER.error(f"*** PROBLEMATIC URL v0.0.43 *** {school_url}")
+			_LOGGER.error("School selection failed: %s", e)
+			_LOGGER.warning(f"*** PROBLEMATIC URL v0.0.43 *** {school_url}")
 			
 			# If school selection fails, try to continue without it
 			# Some accounts might not need explicit school selection
-			_LOGGER.error("*** CONTINUING WITHOUT SCHOOL SELECTION v0.0.43 ***")
+			_LOGGER.debug("*** CONTINUING WITHOUT SCHOOL SELECTION v0.0.43 ***")
 
 	async def _handle_auth_method_selection(self, html: str, page_url: str) -> None:
 		"""Handle authentication method selection by choosing password login."""
-		_LOGGER.error("*** PROCESSING AUTH METHOD SELECTION v0.0.44 ***")
+		_LOGGER.debug("*** PROCESSING AUTH METHOD SELECTION v0.0.44 ***")
 		
 		import re as _re
 		
@@ -1284,7 +1288,7 @@ class InfoMentorAuth:
 		for pattern in password_patterns:
 			password_match = _re.search(pattern, html, _re.IGNORECASE | _re.DOTALL)
 			if password_match:
-				_LOGGER.error(f"*** FOUND PASSWORD LINK PATTERN v0.0.46 *** {pattern}")
+				_LOGGER.debug(f"*** FOUND PASSWORD LINK PATTERN v0.0.46 *** {pattern}")
 				break
 		
 		if password_match:
@@ -1294,7 +1298,7 @@ class InfoMentorAuth:
 			# The URL often contains things like &#37;c3&#37;b6 which need to be decoded
 			import html
 			password_url = html.unescape(password_url)
-			_LOGGER.error(f"*** DECODED PASSWORD URL v0.0.79 *** {password_url}")
+			_LOGGER.debug(f"*** DECODED PASSWORD URL v0.0.79 *** {password_url}")
 			
 			# Handle relative URLs
 			from urllib.parse import urljoin
@@ -1305,7 +1309,7 @@ class InfoMentorAuth:
 				base_url = '/'.join(page_url.split('/')[:-1]) + '/'
 				password_url = urljoin(base_url, password_url)
 			
-			_LOGGER.error(f"*** SELECTING PASSWORD AUTH METHOD v0.0.79 *** {password_url}")
+			_LOGGER.debug(f"*** SELECTING PASSWORD AUTH METHOD v0.0.79 *** {password_url}")
 			
 			headers = DEFAULT_HEADERS.copy()
 			headers.update({
@@ -1315,26 +1319,26 @@ class InfoMentorAuth:
 			try:
 				await asyncio.sleep(REQUEST_DELAY)
 				async with self.session.get(password_url, headers=headers, allow_redirects=True) as resp:
-					_LOGGER.error(f"*** AUTH METHOD SELECTION RESULT v0.0.44 *** {resp.status} -> {resp.url}")
+					_LOGGER.debug(f"*** AUTH METHOD SELECTION RESULT v0.0.44 *** {resp.status} -> {resp.url}")
 					
 					auth_method_text = await resp.text()
 					
 					# Handle any auto-submit forms that might appear
-					if 'id="openid_message"' in auth_method_text:
-						_LOGGER.error("*** AUTH METHOD RETURNED AUTO-SUBMIT FORM v0.0.44 ***")
+					if _has_openid_form(auth_method_text):
+						_LOGGER.info("Auth method returned auto-submit form")
 						form_result = await _auto_submit_openid_form(self.session, auth_method_text, str(resp.url))
 						if form_result.executed:
-							_LOGGER.error("*** AUTH METHOD AUTO-SUBMIT COMPLETED v0.0.44 ***")
+							_LOGGER.debug("*** AUTH METHOD AUTO-SUBMIT COMPLETED v0.0.44 ***")
 					
 			except Exception as e:
-				_LOGGER.error(f"*** AUTH METHOD SELECTION FAILED v0.0.44 *** {e}")
+				_LOGGER.warning(f"*** AUTH METHOD SELECTION FAILED v0.0.44 *** {e}")
 		else:
-			_LOGGER.error("*** NO PASSWORD AUTH METHOD FOUND v0.0.44 ***")
-			_LOGGER.error(f"*** AUTH METHOD PAGE SNIPPET v0.0.44 *** {html[:500]}...")
+			_LOGGER.warning("*** NO PASSWORD AUTH METHOD FOUND v0.0.44 ***")
+			_LOGGER.debug(f"*** AUTH METHOD PAGE SNIPPET v0.0.44 *** {html[:500]}...")
 
 	async def _handle_auth_method_fallback(self, page_url: str) -> None:
 		"""Fallback method to handle authentication method selection by constructing URL directly."""
-		_LOGGER.error("*** PROCESSING AUTH METHOD FALLBACK v0.0.47 ***")
+		_LOGGER.debug("*** PROCESSING AUTH METHOD FALLBACK v0.0.47 ***")
 		
 		# Extract the base URL and try to construct the password selection URL
 		# Example URL: https://idp01.avesta.se/wa/chooseAuthmech?authmechs=App%20-%20SmartID:App%20-%20SmartID;L%C3%B6senord:L%C3%B6senord;Tj%C3%A4nstekort:Tj%C3%A4nstekort
@@ -1360,53 +1364,53 @@ class InfoMentorAuth:
 		
 		for password_url in possible_password_urls:
 			try:
-				_LOGGER.error(f"*** TRYING FALLBACK URL v0.0.47 *** {password_url}")
+				_LOGGER.debug(f"*** TRYING FALLBACK URL v0.0.47 *** {password_url}")
 				await asyncio.sleep(REQUEST_DELAY)
 				
 				async with self.session.get(password_url, headers=headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as resp:
 					if resp.status == 200:
-						_LOGGER.error(f"*** FALLBACK URL SUCCESS v0.0.47 *** {resp.status} -> {resp.url}")
+						_LOGGER.debug(f"*** FALLBACK URL SUCCESS v0.0.47 *** {resp.status} -> {resp.url}")
 						auth_result_text = await resp.text()
 						
 						# Check if this led to a login form or another redirect
 						if any(field in auth_result_text.lower() for field in ['txtnotandanafn', 'txtlykilord', 'password', 'username']):
-							_LOGGER.error("*** FALLBACK LED TO LOGIN FORM v0.0.47 ***")
+							_LOGGER.debug("*** FALLBACK LED TO LOGIN FORM v0.0.47 ***")
 							return  # Success - let the normal flow handle the login form
-						elif 'id="openid_message"' in auth_result_text:
-							_LOGGER.error("*** FALLBACK RETURNED AUTO-SUBMIT FORM v0.0.47 ***")
+						elif _has_openid_form(auth_result_text):
+							_LOGGER.info("Fallback returned auto-submit form")
 							form_result = await _auto_submit_openid_form(self.session, auth_result_text, str(resp.url))
 							if form_result.executed:
-								_LOGGER.error("*** FALLBACK AUTO-SUBMIT COMPLETED v0.0.47 ***")
+								_LOGGER.debug("*** FALLBACK AUTO-SUBMIT COMPLETED v0.0.47 ***")
 								return
 						else:
-							_LOGGER.error(f"*** FALLBACK URL UNCLEAR RESULT v0.0.47 *** {auth_result_text[:200]}...")
+							_LOGGER.debug(f"*** FALLBACK URL UNCLEAR RESULT v0.0.47 *** {auth_result_text[:200]}...")
 					else:
-						_LOGGER.error(f"*** FALLBACK URL FAILED v0.0.47 *** {resp.status}")
+						_LOGGER.warning(f"*** FALLBACK URL FAILED v0.0.47 *** {resp.status}")
 						
 			except Exception as e:
-				_LOGGER.error(f"*** FALLBACK URL EXCEPTION v0.0.47 *** {password_url} -> {e}")
+				_LOGGER.warning(f"*** FALLBACK URL EXCEPTION v0.0.47 *** {password_url} -> {e}")
 				continue
 		
-		_LOGGER.error("*** ALL FALLBACK URLS FAILED v0.0.47 ***")
+		_LOGGER.warning("*** ALL FALLBACK URLS FAILED v0.0.47 ***")
 
 	async def _direct_login_with_credentials(self, username: str, password: str) -> None:
 		"""Login directly using username/password on the main InfoMentor login page."""
-		_LOGGER.error("*** STARTING DIRECT LOGIN v0.0.51 ***")
+		_LOGGER.debug("*** STARTING DIRECT LOGIN v0.0.51 ***")
 
 		login_url = LEGACY_BASE_URL
 		headers = DEFAULT_HEADERS.copy()
 
 		try:
 			login_page, final_login_url, status = await self._fetch_login_page(login_url, headers)
-			_LOGGER.error(f"*** LOGIN PAGE RESPONSE v0.0.51 *** {status} -> {final_login_url}")
-			_LOGGER.error(f"*** LOGIN PAGE LENGTH v0.0.51 *** {len(login_page)} chars")
+			_LOGGER.debug(f"*** LOGIN PAGE RESPONSE v0.0.51 *** {status} -> {final_login_url}")
+			_LOGGER.debug(f"*** LOGIN PAGE LENGTH v0.0.51 *** {len(login_page)} chars")
 
 			await _write_text_file_async("/tmp/infomentor_login_page.html", login_page)
-			_LOGGER.error("*** SAVED LOGIN PAGE v0.0.51 *** /tmp/infomentor_login_page.html")
+			_LOGGER.debug("*** SAVED LOGIN PAGE v0.0.51 *** /tmp/infomentor_login_page.html")
 
 			login_form = self._select_login_form(login_page)
 			if not login_form:
-				_LOGGER.error("*** NO LOGIN FORM FOUND v0.0.51 ***")
+				_LOGGER.error("No login form found on main page")
 				raise InfoMentorAuthError("Could not find login form on main page")
 
 			form_action_url = self._resolve_form_action(final_login_url, login_form.action)
@@ -1417,15 +1421,15 @@ class InfoMentorAuth:
 			)
 
 			if not username_field or not password_field:
-				_LOGGER.error("*** COULD NOT FIND LOGIN FIELDS v0.0.51 ***")
+				_LOGGER.error("Could not identify login fields in form")
 				raise InfoMentorAuthError("Could not find username/password fields")
 
 			field_names = [name for name, _ in form_fields]
-			_LOGGER.error(
+			_LOGGER.debug(
 				f"*** LOGIN FIELDS v0.0.51 *** username={username_field}, password={password_field}, submit={submit_field}"
 			)
-			_LOGGER.error(f"*** SUBMITTING LOGIN FORM v0.0.51 *** {form_action_url}")
-			_LOGGER.error(f"*** FORM FIELD COUNT v0.0.51 *** {len(field_names)}")
+			_LOGGER.debug(f"*** SUBMITTING LOGIN FORM v0.0.51 *** {form_action_url}")
+			_LOGGER.debug(f"*** FORM FIELD COUNT v0.0.51 *** {len(field_names)}")
 			_LOGGER.debug(f"*** FORM FIELD SAMPLE v0.0.51 *** {field_names[:15]}")
 
 			await asyncio.sleep(REQUEST_DELAY)
@@ -1435,11 +1439,11 @@ class InfoMentorAuth:
 				form_fields,
 				final_login_url,
 			)
-			_LOGGER.error(f"*** LOGIN RESULT v0.0.51 *** {status} -> {final_url}")
-			_LOGGER.error(f"*** LOGIN RESULT LENGTH v0.0.51 *** {len(login_result)} chars")
+			_LOGGER.debug(f"*** LOGIN RESULT v0.0.51 *** {status} -> {final_url}")
+			_LOGGER.debug(f"*** LOGIN RESULT LENGTH v0.0.51 *** {len(login_result)} chars")
 
 			await _write_text_file_async("/tmp/infomentor_login_result.html", login_result)
-			_LOGGER.error("*** SAVED LOGIN RESULT v0.0.51 *** /tmp/infomentor_login_result.html")
+			_LOGGER.debug("*** SAVED LOGIN RESULT v0.0.51 *** /tmp/infomentor_login_result.html")
 
 			success_indicators = [
 				"student-menu",
@@ -1453,7 +1457,7 @@ class InfoMentorAuth:
 			is_success = any(indicator in login_result.lower() for indicator in success_indicators)
 
 			if is_success:
-				_LOGGER.error("*** DIRECT LOGIN SUCCESS v0.0.51 ***")
+				_LOGGER.debug("*** DIRECT LOGIN SUCCESS v0.0.51 ***")
 			else:
 				error_indicators = [
 					"felaktigt",
@@ -1466,14 +1470,14 @@ class InfoMentorAuth:
 				has_error = any(indicator in login_result.lower() for indicator in error_indicators)
 
 				if has_error:
-					_LOGGER.error("*** DIRECT LOGIN FAILED - INVALID CREDENTIALS v0.0.51 ***")
+					_LOGGER.error("Direct login failed — invalid credentials")
 					raise InfoMentorAuthError("Invalid username or password")
 				else:
-					_LOGGER.error("*** DIRECT LOGIN UNCLEAR RESULT v0.0.51 ***")
-					_LOGGER.error(f"*** RESULT SAMPLE v0.0.51 *** {login_result[:500]}...")
+					_LOGGER.debug("*** DIRECT LOGIN UNCLEAR RESULT v0.0.51 ***")
+					_LOGGER.debug(f"*** RESULT SAMPLE v0.0.51 *** {login_result[:500]}...")
 
 		except Exception as e:
-			_LOGGER.error(f"*** DIRECT LOGIN EXCEPTION v0.0.51 *** {e}")
+			_LOGGER.error("Direct login exception: %s", e)
 			raise
 
 	async def _verify_authentication_status(self) -> bool:
@@ -1514,9 +1518,46 @@ class InfoMentorAuth:
 		_LOGGER.warning("Could not verify authentication status - OAuth may have failed")
 		return False
 	
+	async def _establish_cross_domain_sessions(self) -> None:
+		"""Visit key InfoMentor domains after auth to propagate session cookies.
+
+		The OAuth/WS-Fed flow establishes cookies on hub.infomentor.se, but
+		API calls to im.infomentor.se and legacy infomentor.se need their own
+		cookies.  Visiting each domain with allow_redirects lets the server
+		issue the necessary set-cookie headers, mirroring what a browser does
+		when the SPA loads resources from multiple subdomains.
+		"""
+		domains_to_visit = [
+			(f"{MODERN_BASE_URL}/", "im.infomentor.se"),
+			(f"{HUB_BASE_URL}/", "hub.infomentor.se"),
+			(f"{LEGACY_BASE_URL}", "legacy infomentor.se"),
+		]
+
+		headers = DEFAULT_HEADERS.copy()
+		headers["Referer"] = f"{HUB_BASE_URL}/"
+
+		for url, label in domains_to_visit:
+			try:
+				await asyncio.sleep(REQUEST_DELAY)
+				async with self.session.get(url, headers=headers, allow_redirects=True) as resp:
+					body = await resp.text()
+
+					if _has_openid_form(body):
+						result = await _auto_submit_openid_form(self.session, body, referer=str(resp.url))
+						if result.executed:
+							_LOGGER.debug("Cross-domain auto-submit completed for %s", label)
+
+					_LOGGER.debug(
+						"Cross-domain session visit to %s: status=%s cookies_after=%d",
+						label, resp.status,
+						sum(1 for _ in self.session.cookie_jar),
+					)
+			except Exception as err:
+				_LOGGER.debug("Cross-domain session visit to %s failed: %s", label, err)
+
 	async def _try_alternative_hub_access(self, headers: dict) -> None:
 		"""Try alternative methods to access the hub dashboard."""
-		_LOGGER.error("*** TRYING ALTERNATIVE HUB ACCESS v0.0.53 ***")
+		_LOGGER.debug("*** TRYING ALTERNATIVE HUB ACCESS v0.0.53 ***")
 		
 		# List of alternative URLs to try
 		alternative_urls = [
@@ -1528,24 +1569,24 @@ class InfoMentorAuth:
 		
 		for alt_url in alternative_urls:
 			try:
-				_LOGGER.error(f"*** TRYING ALTERNATIVE URL v0.0.53 *** {alt_url}")
+				_LOGGER.debug(f"*** TRYING ALTERNATIVE URL v0.0.53 *** {alt_url}")
 				await asyncio.sleep(REQUEST_DELAY)
 				async with self.session.get(alt_url, headers=headers, allow_redirects=True) as resp:
-					_LOGGER.error(f"*** ALTERNATIVE URL RESPONSE v0.0.53 *** {resp.status} -> {resp.url}")
+					_LOGGER.debug(f"*** ALTERNATIVE URL RESPONSE v0.0.53 *** {resp.status} -> {resp.url}")
 					
 					# If we get a good response without auto-submit, we might have found the right path
 					alt_text = await resp.text()
-					if len(alt_text) > 10000 and 'id="openid_message"' not in alt_text:
-						_LOGGER.error(f"*** FOUND GOOD ALTERNATIVE v0.0.53 *** {alt_url} -> {len(alt_text)} chars")
+					if len(alt_text) > 10000 and not _has_openid_form(alt_text):
+						_LOGGER.debug(f"*** FOUND GOOD ALTERNATIVE v0.0.53 *** {alt_url} -> {len(alt_text)} chars")
 						await _write_text_file_async(f"/tmp/infomentor_hub_alt_{alt_url.split('/')[-1]}.html", alt_text)
 						break
 			except Exception as e:
-				_LOGGER.error(f"*** ALTERNATIVE URL ERROR v0.0.53 *** {alt_url}: {e}")
+				_LOGGER.warning(f"*** ALTERNATIVE URL ERROR v0.0.53 *** {alt_url}: {e}")
 				continue
 	
 	async def _get_pupil_ids_modern(self) -> list[str]:
 		"""Get pupil IDs from modern InfoMentor Hub interface."""
-		_LOGGER.error("*** GETTING PUPIL IDS FROM HUB v0.0.64 ***")
+		_LOGGER.info("Getting pupil IDs from hub")
 		
 		# Add loop detection to prevent infinite redirect cycles
 		school_selection_attempts = 0
@@ -1561,34 +1602,31 @@ class InfoMentorAuth:
 			# Try the main hub dashboard root (where OAuth leads us)
 			await asyncio.sleep(REQUEST_DELAY)
 			async with self.session.get(dashboard_url, headers=headers) as resp:
-				_LOGGER.error(f"*** HUB DASHBOARD REQUEST v0.0.64 *** {dashboard_url} -> status: {resp.status}")
+				_LOGGER.info("Hub dashboard: status=%s (%d chars)", resp.status, 0)
 				text = await resp.text()
-				_LOGGER.error(f"*** HUB DASHBOARD CONTENT LENGTH v0.0.64 *** {len(text)}")
-				
-				# Save hub dashboard response for analysis
+				_LOGGER.info("Hub dashboard content length: %d", len(text))
+
 				await _write_text_file_async("/tmp/infomentor_hub_dashboard.html", text)
-				_LOGGER.error("*** SAVED HUB DASHBOARD v0.0.53 *** /tmp/infomentor_hub_dashboard.html")
-				
-				# Handle auto-submit form - try multiple strategies to get real hub content
-				if ('id="openid_message"' in text) or ('id=\'openid_message\'' in text):
+
+				if _has_openid_form(text):
 					auto_submit_attempts += 1
-					_LOGGER.error(f"*** DETECTED AUTO-SUBMIT FORM ON HUB v0.0.64 *** attempt {auto_submit_attempts}/{max_auto_submit_attempts}")
-					_LOGGER.error(f"*** CONTENT LENGTH IS ONLY {len(text)} - NEED TO GET REAL HUB v0.0.64 ***")
+					_LOGGER.info("Hub returned auto-submit form (attempt %d/%d, %d chars)", auto_submit_attempts, max_auto_submit_attempts, len(text))
+					_LOGGER.debug(f"*** CONTENT LENGTH IS ONLY {len(text)} - NEED TO GET REAL HUB v0.0.64 ***")
 					
 					# Prevent infinite auto-submit loops
 					if auto_submit_attempts > max_auto_submit_attempts:
-						_LOGGER.error(f"*** AUTO-SUBMIT LOOP DETECTED v0.0.64 *** stopping after {auto_submit_attempts} attempts")
+						_LOGGER.error("Auto-submit loop detected — stopping after %d attempts", auto_submit_attempts)
 						raise InfoMentorAuthError("Auto-submit loop detected - authentication failed")
 					
 					# Check if the auto-submit would take us to legacy interface
 					action_match = re.search(r'action=["\']([^"\']+)["\']', text, re.IGNORECASE)
 					if action_match:
 						action_url = action_match.group(1)
-						_LOGGER.error(f"*** AUTO-SUBMIT ACTION URL v0.0.64 *** {action_url}")
+						_LOGGER.debug(f"*** AUTO-SUBMIT ACTION URL v0.0.64 *** {action_url}")
 						
 						# If it would take us to legacy, try alternative approaches first
 						if "infomentor.se/swedish/production/mentor" in action_url.lower():
-							_LOGGER.error("*** AUTO-SUBMIT LEADS TO LEGACY - TRYING ALTERNATIVES v0.0.64 ***")
+							_LOGGER.debug("*** AUTO-SUBMIT LEADS TO LEGACY - TRYING ALTERNATIVES v0.0.64 ***")
 							
 							# Strategy 1: Try multiple hub URLs to find one that works
 							hub_alternatives = [
@@ -1601,63 +1639,63 @@ class InfoMentorAuth:
 							found_real_hub = False
 							for alt_url in hub_alternatives:
 								try:
-									_LOGGER.error(f"*** TRYING HUB ALTERNATIVE v0.0.55 *** {alt_url}")
+									_LOGGER.debug(f"*** TRYING HUB ALTERNATIVE v0.0.55 *** {alt_url}")
 									await asyncio.sleep(REQUEST_DELAY)
 									async with self.session.get(alt_url, headers=headers, allow_redirects=True) as alt_resp:
 										alt_text = await alt_resp.text()
-										_LOGGER.error(f"*** ALTERNATIVE RESULT v0.0.55 *** {alt_resp.status} -> {len(alt_text)} chars")
+										_LOGGER.debug(f"*** ALTERNATIVE RESULT v0.0.55 *** {alt_resp.status} -> {len(alt_text)} chars")
 										
 										# If we get substantial content without auto-submit, use it
-										if len(alt_text) > 10000 and 'id="openid_message"' not in alt_text:
-											_LOGGER.error(f"*** FOUND REAL HUB CONTENT v0.0.55 *** {alt_url}")
+										if len(alt_text) > 10000 and not _has_openid_form(alt_text):
+											_LOGGER.debug(f"*** FOUND REAL HUB CONTENT v0.0.55 *** {alt_url}")
 											text = alt_text
 											found_real_hub = True
 											await _write_text_file_async("/tmp/infomentor_hub_alternative_success.html", text)
 											break
 								except Exception as e:
-									_LOGGER.error(f"*** ALTERNATIVE ERROR v0.0.55 *** {alt_url}: {e}")
+									_LOGGER.warning(f"*** ALTERNATIVE ERROR v0.0.55 *** {alt_url}: {e}")
 									continue
 							
 							# Strategy 2: If alternatives failed, wait and retry main hub URL
 							if not found_real_hub:
-								_LOGGER.error("*** ALTERNATIVES FAILED - WAITING AND RETRYING MAIN HUB v0.0.55 ***")
+								_LOGGER.debug("*** ALTERNATIVES FAILED - WAITING AND RETRYING MAIN HUB v0.0.55 ***")
 								await asyncio.sleep(REQUEST_DELAY * 3)  # Wait longer
 								async with self.session.get(dashboard_url, headers=headers) as retry_resp:
 									retry_text = await retry_resp.text()
-									_LOGGER.error(f"*** RETRY RESULT v0.0.55 *** {retry_resp.status} -> {len(retry_text)} chars")
+									_LOGGER.debug(f"*** RETRY RESULT v0.0.55 *** {retry_resp.status} -> {len(retry_text)} chars")
 									
-									if len(retry_text) > 10000 and 'id="openid_message"' not in retry_text:
-										_LOGGER.error("*** RETRY FOUND REAL HUB CONTENT v0.0.55 ***")
+									if len(retry_text) > 10000 and not _has_openid_form(retry_text):
+										_LOGGER.debug("*** RETRY FOUND REAL HUB CONTENT v0.0.55 ***")
 										text = retry_text
 										found_real_hub = True
 									else:
-										_LOGGER.error("*** RETRY STILL RETURNS AUTO-SUBMIT - PROCEEDING WITH FORM v0.0.55 ***")
+										_LOGGER.debug("*** RETRY STILL RETURNS AUTO-SUBMIT - PROCEEDING WITH FORM v0.0.55 ***")
 							
 							# Strategy 3: If everything failed, follow the auto-submit as last resort
 							if not found_real_hub:
-								_LOGGER.error("*** ALL STRATEGIES FAILED - FOLLOWING AUTO-SUBMIT v0.0.55 ***")
+								_LOGGER.debug("*** ALL STRATEGIES FAILED - FOLLOWING AUTO-SUBMIT v0.0.55 ***")
 								form_result = await _auto_submit_openid_form(self.session, text, referer=dashboard_url)
 								if form_result.executed and form_result.final_text:
 									text = form_result.final_text
-									_LOGGER.error(f"*** USING AUTO-SUBMIT RESULT v0.0.55 *** length={len(text)}")
+									_LOGGER.debug(f"*** USING AUTO-SUBMIT RESULT v0.0.55 *** length={len(text)}")
 						else:
 							# Safe to follow the auto-submit
-							_LOGGER.error("*** AUTO-SUBMIT SAFE - PROCEEDING v0.0.55 ***")
+							_LOGGER.debug("*** AUTO-SUBMIT SAFE - PROCEEDING v0.0.55 ***")
 							form_result = await _auto_submit_openid_form(self.session, text, referer=dashboard_url)
 							if form_result.executed and form_result.final_text:
 								text = form_result.final_text
-								_LOGGER.error(f"*** USING AUTO-SUBMIT FINAL RESPONSE v0.0.55 *** length={len(text)}")
+								_LOGGER.debug(f"*** USING AUTO-SUBMIT FINAL RESPONSE v0.0.55 *** length={len(text)}")
 					else:
-						_LOGGER.error("*** NO ACTION URL FOUND IN AUTO-SUBMIT FORM v0.0.55 ***")
+						_LOGGER.debug("*** NO ACTION URL FOUND IN AUTO-SUBMIT FORM v0.0.55 ***")
 
 				# Check if school selection fields appear on hub (shouldn't happen if credentials were submitted correctly)
 				if "IdpListRepeater" in text and ("elever" in text or "kommun" in text):
 					school_selection_attempts += 1
-					_LOGGER.error(f"*** UNEXPECTED: SCHOOL SELECTION FIELDS ON HUB v0.0.98 *** attempt {school_selection_attempts}/{max_school_selection_attempts}")
-					_LOGGER.error("*** This suggests credentials were not submitted with all form fields")
+					_LOGGER.warning(f"*** UNEXPECTED: SCHOOL SELECTION FIELDS ON HUB v0.0.98 *** attempt {school_selection_attempts}/{max_school_selection_attempts}")
+					_LOGGER.warning("*** This suggests credentials were not submitted with all form fields")
 					
 					if school_selection_attempts > max_school_selection_attempts:
-						_LOGGER.error(f"*** SCHOOL SELECTION LOOP DETECTED v0.0.98 *** stopping after {school_selection_attempts} attempts")
+						_LOGGER.error("School selection loop detected — stopping after %d attempts", school_selection_attempts)
 						raise InfoMentorAuthError("Unexpected school selection on hub - authentication may have failed")
 					# Don't try to select a school - just continue and hope for the best
 				else:
@@ -1690,13 +1728,13 @@ class InfoMentorAuth:
 
 				# Prefer hub extraction if hub payload is present, even if legacy URLs appear
 				if self._has_hub_payload(text):
-					_LOGGER.error("*** HUB PAYLOAD DETECTED - USING HUB JSON EXTRACTION v0.0.70 ***")
+					_LOGGER.debug("*** HUB PAYLOAD DETECTED - USING HUB JSON EXTRACTION v0.0.70 ***")
 					pupil_ids = self._extract_pupil_ids_from_json(text)
 				elif "infomentor.se/swedish/production/mentor/" in str(resp.url) or "mentor/" in text:
-					_LOGGER.error("*** DETECTED LEGACY INTERFACE - USING LEGACY EXTRACTION v0.0.70 ***")
+					_LOGGER.debug("*** DETECTED LEGACY INTERFACE - USING LEGACY EXTRACTION v0.0.70 ***")
 					pupil_ids = await self._extract_pupil_ids_legacy(text)
 				else:
-					_LOGGER.error("*** USING HUB JSON EXTRACTION v0.0.70 ***")
+					_LOGGER.debug("*** USING HUB JSON EXTRACTION v0.0.70 ***")
 					pupil_ids = self._extract_pupil_ids_from_json(text)
 
 				if pupil_ids:
@@ -1720,7 +1758,7 @@ class InfoMentorAuth:
 							_LOGGER.debug(f"Alternative URL {alt_url} returned status: {alt_resp.status}")
 						alt_text = await alt_resp.text()
 						# Handle auto-submit forms on alternative URLs as well
-						if ('id="openid_message"' in alt_text) or ('id=\'openid_message\'' in alt_text):
+						if _has_openid_form(alt_text):
 							_LOGGER.debug(f"Detected OpenID form on {alt_url}; submitting...")
 							form_result = await _auto_submit_openid_form(self.session, alt_text, referer=alt_url)
 							if form_result.executed:
@@ -1740,13 +1778,13 @@ class InfoMentorAuth:
 									_LOGGER.debug(f"Reauthentication via alt URL failed: {e_reauth2}")
 							# Check if we're on the legacy interface from alternative URL
 							if self._has_hub_payload(alt_text):
-								_LOGGER.error("*** HUB PAYLOAD DETECTED FROM ALT URL - USING HUB JSON EXTRACTION v0.0.70 ***")
+								_LOGGER.debug("*** HUB PAYLOAD DETECTED FROM ALT URL - USING HUB JSON EXTRACTION v0.0.70 ***")
 								pupil_ids = self._extract_pupil_ids_from_json(alt_text)
 							elif "infomentor.se/swedish/production/mentor/" in str(alt_resp.url) or "mentor/" in alt_text:
-								_LOGGER.error("*** DETECTED LEGACY INTERFACE FROM ALT URL - USING LEGACY EXTRACTION v0.0.70 ***")
+								_LOGGER.debug("*** DETECTED LEGACY INTERFACE FROM ALT URL - USING LEGACY EXTRACTION v0.0.70 ***")
 								pupil_ids = await self._extract_pupil_ids_legacy(alt_text)
 							else:
-								_LOGGER.error("*** USING HUB JSON EXTRACTION FROM ALT URL v0.0.70 ***")
+								_LOGGER.debug("*** USING HUB JSON EXTRACTION FROM ALT URL v0.0.70 ***")
 								pupil_ids = self._extract_pupil_ids_from_json(alt_text)
 
 							if pupil_ids:
@@ -1824,7 +1862,7 @@ class InfoMentorAuth:
 						continue
 			
 			# Try InfoMentor Hub specific patterns first - but prioritize pupils array
-			_LOGGER.error(f"*** TRYING HUB-SPECIFIC EXTRACTION v0.0.53 *** found {len(pupil_ids)} from JSON")
+			_LOGGER.debug(f"*** TRYING HUB-SPECIFIC EXTRACTION v0.0.53 *** found {len(pupil_ids)} from JSON")
 			
 			# Look for the comprehensive pupils array in IMHome.home.homeData - PRIORITY extraction
 			homedata_pattern = r'IMHome\.home\.homeData\s*=\s*(\{.*?"pupils"\s*:\s*\[.*?\].*?\});'
@@ -1834,57 +1872,57 @@ class InfoMentorAuth:
 			hub_specific_pupil_names = {}  # Store names too
 			
 			for homedata_json in homedata_matches:
-				_LOGGER.error(f"*** FOUND HOMEDATA JSON v0.0.54 *** length={len(homedata_json)}")
+				_LOGGER.debug(f"*** FOUND HOMEDATA JSON v0.0.54 *** length={len(homedata_json)}")
 				try:
 					homedata = json.loads(homedata_json)
 					if 'account' in homedata and 'pupils' in homedata['account']:
 						pupils_data = homedata['account']['pupils']
-						_LOGGER.error(f"*** FOUND PUPILS ARRAY v0.0.54 *** count={len(pupils_data)}")
+						_LOGGER.debug(f"*** FOUND PUPILS ARRAY v0.0.54 *** count={len(pupils_data)}")
 						
 						for pupil in pupils_data:
 							pupil_id = str(pupil.get('id', ''))
 							pupil_name = pupil.get('name', '')
-							_LOGGER.error(f"*** PROCESSING PUPIL v0.0.54 *** id={pupil_id} name={pupil_name}")
+							_LOGGER.debug(f"*** PROCESSING PUPIL v0.0.54 *** id={pupil_id} name={pupil_name}")
 							if pupil_id and pupil_id not in hub_specific_pupil_ids:
 								hub_specific_pupil_ids.append(pupil_id)
 								hub_specific_pupil_names[pupil_id] = pupil_name
-								_LOGGER.error(f"*** EXTRACTED PUPIL v0.0.54 *** id={pupil_id} name={pupil_name}")
+								_LOGGER.debug(f"*** EXTRACTED PUPIL v0.0.54 *** id={pupil_id} name={pupil_name}")
 								
 						# If we found pupils via hub-specific method, prioritize them
 						if hub_specific_pupil_ids:
-							_LOGGER.error(f"*** USING HUB-SPECIFIC PUPILS v0.0.54 *** count={len(hub_specific_pupil_ids)}")
+							_LOGGER.debug(f"*** USING HUB-SPECIFIC PUPILS v0.0.54 *** count={len(hub_specific_pupil_ids)}")
 							pupil_ids = hub_specific_pupil_ids  # Replace any previously found IDs
 							
 							# Store the pupil names for later use
 							self.pupil_names = hub_specific_pupil_names
-							_LOGGER.error(f"*** STORED PUPIL NAMES v0.0.54 *** {self.pupil_names}")
+							_LOGGER.debug(f"*** STORED PUPIL NAMES v0.0.54 *** {self.pupil_names}")
 							
 							# Skip filtering for hub-specific pupils since they're from authoritative source
-							_LOGGER.error(f"*** RETURNING HUB-SPECIFIC PUPILS WITHOUT FILTERING v0.0.54 *** {pupil_ids}")
+							_LOGGER.debug(f"*** RETURNING HUB-SPECIFIC PUPILS WITHOUT FILTERING v0.0.54 *** {pupil_ids}")
 							return list(set(pupil_ids))  # Remove duplicates and return immediately
 							
 				except (json.JSONDecodeError, KeyError) as e:
-					_LOGGER.error(f"*** HOMEDATA PARSING ERROR v0.0.53 *** {e}")
+					_LOGGER.warning(f"*** HOMEDATA PARSING ERROR v0.0.53 *** {e}")
 			
 			# Fallback: Look for selectedPupilName pattern (single selected pupil)
 			if not pupil_ids:
 				selected_pupil_pattern = r'selectedPupilName\s*:\s*["\']([^"\']+)["\']'
 				selected_matches = re.findall(selected_pupil_pattern, html_content, re.IGNORECASE)
 				for pupil_name in selected_matches:
-					_LOGGER.error(f"*** FOUND SELECTED PUPIL NAME v0.0.53 *** {pupil_name}")
+					_LOGGER.debug(f"*** FOUND SELECTED PUPIL NAME v0.0.53 *** {pupil_name}")
 					
 				# Look for pupil data in the IMHome.init object specifically
 				imhome_pattern = r'IMHome\s*=\s*\{[^}]*init\s*:\s*\{([^}]*selectedPupilName[^}]*)\}'
 				imhome_matches = re.findall(imhome_pattern, html_content, re.DOTALL | re.IGNORECASE)
 				for init_content in imhome_matches:
-					_LOGGER.error(f"*** FOUND IMHOME INIT CONTENT v0.0.53 *** {init_content[:200]}...")
+					_LOGGER.debug(f"*** FOUND IMHOME INIT CONTENT v0.0.53 *** {init_content[:200]}...")
 					# Look for any numeric IDs in this context
 					id_pattern = r'(\d{6,12})'  # Extended range for longer IDs
 					potential_ids = re.findall(id_pattern, init_content)
 					for potential_id in potential_ids:
 						if potential_id not in pupil_ids and len(potential_id) >= 6:
 							pupil_ids.append(potential_id)
-							_LOGGER.error(f"*** EXTRACTED PUPIL ID FROM IMHOME v0.0.53 *** {potential_id}")
+							_LOGGER.debug(f"*** EXTRACTED PUPIL ID FROM IMHOME v0.0.53 *** {potential_id}")
 			
 			# If JSON extraction didn't find enough, try more specific regex patterns
 			if len(pupil_ids) < 1:  # At least expect one pupil
@@ -1912,20 +1950,20 @@ class InfoMentorAuth:
 			
 			# Remove duplicates and validate final list
 			unique_pupil_ids = list(set(pupil_ids))
-			_LOGGER.error(f"*** UNIQUE PUPIL IDS v0.0.53 *** {unique_pupil_ids}")
+			_LOGGER.debug(f"*** UNIQUE PUPIL IDS v0.0.53 *** {unique_pupil_ids}")
 			
 			# Filter out any IDs that seem to be parent/user accounts
 			filtered_pupil_ids = []
 			for pupil_id in unique_pupil_ids:
 				is_likely_pupil = self._is_likely_pupil_id(pupil_id, html_content)
-				_LOGGER.error(f"*** FILTERING PUPIL ID v0.0.53 *** {pupil_id} -> likely_pupil={is_likely_pupil}")
+				_LOGGER.debug(f"*** FILTERING PUPIL ID v0.0.53 *** {pupil_id} -> likely_pupil={is_likely_pupil}")
 				if is_likely_pupil:
 					filtered_pupil_ids.append(pupil_id)
-					_LOGGER.error(f"*** KEPT PUPIL ID v0.0.53 *** {pupil_id}")
+					_LOGGER.debug(f"*** KEPT PUPIL ID v0.0.53 *** {pupil_id}")
 				else:
-					_LOGGER.error(f"*** FILTERED OUT PUPIL ID v0.0.53 *** {pupil_id}")
+					_LOGGER.debug(f"*** FILTERED OUT PUPIL ID v0.0.53 *** {pupil_id}")
 			
-			_LOGGER.error(f"*** FINAL FILTERED PUPIL IDS v0.0.53 *** {len(filtered_pupil_ids)} pupils: {filtered_pupil_ids}")
+			_LOGGER.debug(f"*** FINAL FILTERED PUPIL IDS v0.0.53 *** {len(filtered_pupil_ids)} pupils: {filtered_pupil_ids}")
 			
 			return filtered_pupil_ids
 			
@@ -2032,7 +2070,7 @@ class InfoMentorAuth:
 	
 	async def _extract_pupil_ids_legacy(self, html_content: str) -> list[str]:
 		"""Extract pupil IDs from legacy InfoMentor interface."""
-		_LOGGER.error("*** EXTRACTING PUPIL IDS FROM LEGACY INTERFACE v0.0.70 ***")
+		_LOGGER.debug("*** EXTRACTING PUPIL IDS FROM LEGACY INTERFACE v0.0.70 ***")
 
 		try:
 			# We already have the HTML content from the auto-submit result
@@ -2040,7 +2078,7 @@ class InfoMentorAuth:
 
 			# Save for debugging
 			await _write_text_file_async("/tmp/infomentor_legacy_dashboard.html", text)
-			_LOGGER.error("*** SAVED LEGACY DASHBOARD FOR DEBUG v0.0.70 ***")
+			_LOGGER.debug("*** SAVED LEGACY DASHBOARD FOR DEBUG v0.0.70 ***")
 
 			# Look for legacy pupil patterns - more comprehensive patterns
 			patterns = [
@@ -2090,7 +2128,7 @@ class InfoMentorAuth:
 			pupil_ids = list(set(pupil_ids))
 			pupil_ids = [pid for pid in pupil_ids if 8 <= len(pid) <= 12]
 
-			_LOGGER.error(f"*** FOUND LEGACY PUPIL IDS v0.0.70 *** {pupil_ids}")
+			_LOGGER.debug(f"*** FOUND LEGACY PUPIL IDS v0.0.70 *** {pupil_ids}")
 
 			if pupil_ids:
 				_LOGGER.debug(f"Found {len(pupil_ids)} legacy pupil IDs: {pupil_ids}")
@@ -2100,7 +2138,7 @@ class InfoMentorAuth:
 			_LOGGER.error(f"Legacy pupil ID extraction failed: {e}")
 
 		# If no pupil IDs found, try the old method as fallback
-		_LOGGER.error("*** TRYING OLD LEGACY METHOD AS FALLBACK v0.0.70 ***")
+		_LOGGER.debug("*** TRYING OLD LEGACY METHOD AS FALLBACK v0.0.70 ***")
 		return await self._get_pupil_ids_legacy()
 
 	async def _get_pupil_ids_legacy(self) -> list[str]:

@@ -24,6 +24,9 @@ FIRST_ATTEMPT_HOUR = 2  # First attempt at 2 AM
 RETRY_INTERVAL_MINUTES = 20  # Retry every 20 minutes
 MAX_RETRIES_PER_DAY = 36  # Maximum retries in a day (12 hours worth of 20-minute intervals)
 
+# Notification polling
+NOTIFICATION_CHECK_INTERVAL_MINUTES = 5
+
 # Sensor types
 SENSOR_NEWS = "news"
 SENSOR_TIMELINE = "timeline"
@@ -36,6 +39,12 @@ SENSOR_HAS_PRESCHOOL_TODAY = "has_preschool_today"
 SENSOR_HAS_SCHOOL_TOMORROW = "has_school_tomorrow"
 SENSOR_DASHBOARD = "dashboard"
 SENSOR_DATA_FRESHNESS = "data_freshness"
+SENSOR_NOTIFICATIONS = "notifications"
+SENSOR_DIAGNOSTIC_LOG = "diagnostic_log"
+
+# Button entities
+BUTTON_DIAGNOSTICS_REFRESH = "diagnostics_refresh"
+BUTTON_DIAGNOSTICS_FULL = "diagnostics_full_refresh"
 
 # Attributes
 ATTR_PUPIL_ID = "pupil_id"
@@ -58,6 +67,10 @@ ATTR_LATEST_END = "latest_end"
 EVENT_NEW_NEWS = f"{DOMAIN}_new_news"
 EVENT_NEW_TIMELINE = f"{DOMAIN}_new_timeline"
 EVENT_SCHEDULE_UPDATED = f"{DOMAIN}_schedule_updated"
+EVENT_NEW_NOTIFICATION = f"{DOMAIN}_new_notification"
+
+# Configuration keys
+CONF_NOTIFY_SERVICES = "notify_services"
 
 # Services
 SERVICE_REFRESH_DATA = "refresh_data"
@@ -66,3 +79,4 @@ SERVICE_FORCE_REFRESH = "force_refresh"
 SERVICE_DEBUG_AUTH = "debug_authentication"
 SERVICE_CLEANUP_DUPLICATES = "cleanup_duplicate_entities"
 SERVICE_RETRY_AUTH = "retry_authentication"
+SERVICE_DIAGNOSTIC_POKE = "diagnostic_poke"

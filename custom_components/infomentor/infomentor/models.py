@@ -140,6 +140,64 @@ class TimeRegistrationEntry:
 
 
 @dataclass
+class InfoMentorNotification:
+	"""A notification from InfoMentor's NotificationApp."""
+	id: int
+	title: str
+	sub_title: str
+	date_sent: datetime
+	app_type: str
+	state: str
+	notification_type: str
+	url: str
+	pupil_im2_id: Optional[int] = None
+	pupil_source_id: Optional[str] = None
+	currently_selected_pupil: bool = False
+	entity_type: Optional[str] = None
+
+	@staticmethod
+	def from_dict(data: dict) -> "InfoMentorNotification":
+		sent_str = data.get("dateSent") or data.get("orderDate", "")
+		try:
+			date_sent = datetime.strptime(sent_str, "%Y-%m-%dT%H:%M:%S") if sent_str else datetime.now()
+		except (ValueError, TypeError):
+			date_sent = datetime.now()
+
+		return InfoMentorNotification(
+			id=int(data.get("id", 0)),
+			title=data.get("title", ""),
+			sub_title=data.get("subTitle", ""),
+			date_sent=date_sent,
+			app_type=data.get("appType", ""),
+			state=data.get("state", ""),
+			notification_type=data.get("type", ""),
+			url=data.get("url", ""),
+			pupil_im2_id=data.get("pupilIM2Id"),
+			pupil_source_id=data.get("pupilSourceId"),
+			currently_selected_pupil=data.get("currentlySelectedPupil", False),
+			entity_type=data.get("entityTypeString"),
+		)
+
+	@property
+	def is_new(self) -> bool:
+		return self.state == "New"
+
+	@property
+	def full_url(self) -> str:
+		"""Build a complete URL for the notification."""
+		base = "https://hub.infomentor.se"
+		raw = self.url
+		if raw.startswith("http"):
+			return raw
+		if raw.startswith("#/") or raw.startswith("/#/"):
+			return f"{base}/{raw.lstrip('/#')}"
+		return f"{base}/{raw.lstrip('/')}"
+
+	def __str__(self) -> str:
+		return f"{self.title} ({self.date_sent.strftime('%Y-%m-%d %H:%M')})"
+
+
+@dataclass
 class ScheduleDay:
 	"""A complete schedule for a single day."""
 	date: datetime

@@ -80,3 +80,19 @@ retry_authentication:
       default: false
       selector:
         boolean:
+
+diagnostic_poke:
+  name: Diagnostic poke
+  description: >
+    Re-login, bypass notification and auth backoff throttles, and run a data refresh immediately.
+    Same as the "Run diagnostics" button on the InfoMentor device.
+  target:
+    device:
+      integration: infomentor
+  fields:
+    clear_cache:
+      name: Clear in-memory schedule cache
+      description: Also clear today/tomorrow schedule cache before refreshing (like "Full refresh" button)
+      default: false
+      selector:
+        boolean:
