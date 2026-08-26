@@ -31,6 +31,18 @@ For each pupil, the integration creates several sensors:
 #### Communication Sensors
 - **News**: Count and details of unread school news
 - **Timeline**: Count and details of timeline entries
+- **Latest 1/2/3 News**: Title and content summaries suitable for dashboards, Assist, and MCP
+- **Latest 1/3/5 Homework**: Assignment/homework summaries suitable for dashboards, Assist, and MCP
+
+#### Assist and MCP Schedule Sensors
+- **Yesterday Class Schedule**: Yesterday's classes in a readable sensor state
+- **Today Class Schedule**: Today's classes in a readable sensor state
+- **Tomorrow Class Schedule**: Tomorrow's classes in a readable sensor state
+- **Week Class Schedule**: The current Sunday-through-Saturday calendar week
+
+The concise sensor states fit Home Assistant's state limit. Complete structured entries
+remain available as entity attributes. Expose only the desired summary entities under
+**Settings → Voice assistants → Expose** to make them available through Home Assistant MCP.
 
 #### Notification Sensors
 - **Notifications**: Unread notification count; attributes include the latest 20 notifications with title, date, type, pupil, URL, and state

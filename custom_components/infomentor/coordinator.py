@@ -482,13 +482,17 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			
 		try:
 			# Get schedule (timetable and time registration)
-			start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+			# Include the entire current Sunday-Saturday week so dashboard/Assist
+			# summaries can answer retrospective questions later in the week.
+			now_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+			days_since_sunday = (now_start.weekday() + 1) % 7
+			start_date = now_start - timedelta(days=days_since_sunday)
 			
 			# Calculate end date to ensure we get through the end of the following week
 			# This prevents Monday cache issues by always having the following week's data
-			current_weekday = start_date.weekday()  # Monday = 0, Sunday = 6
-			days_until_next_sunday = 13 - current_weekday  # Days to get to the Sunday of next week
-			end_date = start_date + timedelta(days=days_until_next_sunday)
+			current_weekday = now_start.weekday()  # Monday = 0, Sunday = 6
+			days_until_following_sunday = 13 - current_weekday
+			end_date = now_start + timedelta(days=days_until_following_sunday)
 			
 			schedule_days = await self.client.get_schedule(pupil_id, start_date, end_date)
 			
@@ -979,6 +983,16 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		
 		for day in schedule:
 			if day.date.date() == tomorrow:
+				return day
+		return None
+
+	def get_yesterday_schedule(self, pupil_id: str) -> Optional[ScheduleDay]:
+		"""Get yesterday's schedule for a pupil."""
+		schedule = self.get_pupil_schedule(pupil_id)
+		yesterday = datetime.now().date() - timedelta(days=1)
+
+		for day in schedule:
+			if day.date.date() == yesterday:
 				return day
 		return None
 		

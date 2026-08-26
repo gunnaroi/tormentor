@@ -29,6 +29,9 @@ from .const import (
 	SENSOR_DATA_FRESHNESS,
 	SENSOR_NOTIFICATIONS,
 	SENSOR_DIAGNOSTIC_LOG,
+	SENSOR_HOMEWORK_SUMMARY,
+	SENSOR_NEWS_SUMMARY,
+	SENSOR_SCHEDULE_SUMMARY,
 	ATTR_PUPIL_ID,
 	ATTR_PUPIL_NAME,
 	ATTR_AUTHOR,
@@ -46,6 +49,7 @@ from .const import (
 	ATTR_LATEST_END,
 )
 from .coordinator import InfoMentorDataUpdateCoordinator
+from .summary import entry_summary, is_homework, schedule_day_summary, week_summary
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -91,6 +95,16 @@ async def async_setup_entry(
 					InfoMentorHasSchoolTomorrowSensor(coordinator, config_entry, pupil_id),
 					InfoMentorHasPreschoolTodaySensor(coordinator, config_entry, pupil_id),
 					InfoMentorChildTypeSensor(coordinator, config_entry, pupil_id),
+					InfoMentorHomeworkSummarySensor(coordinator, config_entry, pupil_id, 1),
+					InfoMentorHomeworkSummarySensor(coordinator, config_entry, pupil_id, 3),
+					InfoMentorHomeworkSummarySensor(coordinator, config_entry, pupil_id, 5),
+					InfoMentorNewsSummarySensor(coordinator, config_entry, pupil_id, 1),
+					InfoMentorNewsSummarySensor(coordinator, config_entry, pupil_id, 2),
+					InfoMentorNewsSummarySensor(coordinator, config_entry, pupil_id, 3),
+					InfoMentorScheduleSummarySensor(coordinator, config_entry, pupil_id, "yesterday"),
+					InfoMentorScheduleSummarySensor(coordinator, config_entry, pupil_id, "today"),
+					InfoMentorScheduleSummarySensor(coordinator, config_entry, pupil_id, "tomorrow"),
+					InfoMentorScheduleSummarySensor(coordinator, config_entry, pupil_id, "week"),
 				])
 			except Exception as e:
 				_LOGGER.error(f"Failed to create sensors for pupil {pupil_id}: {e}")
@@ -306,6 +320,151 @@ class InfoMentorNewsSensor(InfoMentorPupilSensorBase):
 				})
 			attributes["news_items"] = news_list
 			
+		return attributes
+
+
+class InfoMentorHomeworkSummarySensor(InfoMentorPupilSensorBase):
+	"""MCP-friendly summary of the latest homework timeline entries."""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str, limit: int) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self.limit = limit
+		self._attr_name = f"{self.pupil_name} Latest {limit} Homework"
+		self._attr_unique_id = (
+			f"{config_entry.entry_id}_{SENSOR_HOMEWORK_SUMMARY}_{limit}_{pupil_id}"
+		)
+		self._attr_icon = "mdi:book-open-page-variant"
+
+	def _entries(self) -> List[Any]:
+		if not self.coordinator.data or self.pupil_id not in self.coordinator.data:
+			return []
+		entries = self.coordinator.data[self.pupil_id].get("timeline", [])
+		return [entry for entry in entries if is_homework(entry)][: self.limit]
+
+	@property
+	def native_value(self) -> str:
+		return entry_summary(self._entries(), self.limit)
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		entries = self._entries()
+		return {
+			ATTR_PUPIL_ID: self.pupil_id,
+			ATTR_PUPIL_NAME: self.pupil_name,
+			"requested_count": self.limit,
+			"entry_count": len(entries),
+			"entries": [
+				{
+					"title": entry.title,
+					"content": entry.content,
+					"date": entry.date.isoformat(),
+					"entry_type": entry.entry_type,
+					"author": entry.author,
+				}
+				for entry in entries
+			],
+		}
+
+
+class InfoMentorNewsSummarySensor(InfoMentorPupilSensorBase):
+	"""MCP-friendly summary of the latest news items."""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str, limit: int) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self.limit = limit
+		self._attr_name = f"{self.pupil_name} Latest {limit} News"
+		self._attr_unique_id = (
+			f"{config_entry.entry_id}_{SENSOR_NEWS_SUMMARY}_{limit}_{pupil_id}"
+		)
+		self._attr_icon = "mdi:newspaper-variant-multiple"
+
+	def _entries(self) -> List[Any]:
+		if not self.coordinator.data or self.pupil_id not in self.coordinator.data:
+			return []
+		return self.coordinator.data[self.pupil_id].get("news", [])[: self.limit]
+
+	@property
+	def native_value(self) -> str:
+		return entry_summary(self._entries(), self.limit)
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		entries = self._entries()
+		return {
+			ATTR_PUPIL_ID: self.pupil_id,
+			ATTR_PUPIL_NAME: self.pupil_name,
+			"requested_count": self.limit,
+			"entry_count": len(entries),
+			"entries": [
+				{
+					"title": entry.title,
+					"content": entry.content,
+					"published_date": entry.published_date.isoformat(),
+					"author": entry.author,
+				}
+				for entry in entries
+			],
+		}
+
+
+class InfoMentorScheduleSummarySensor(InfoMentorPupilSensorBase):
+	"""MCP-friendly summary of a day or the current calendar week."""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str, period: str) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self.period = period
+		period_name = period.capitalize()
+		self._attr_name = f"{self.pupil_name} {period_name} Class Schedule"
+		self._attr_unique_id = (
+			f"{config_entry.entry_id}_{SENSOR_SCHEDULE_SUMMARY}_{period}_{pupil_id}"
+		)
+		self._attr_icon = "mdi:calendar-text"
+
+	def _day(self) -> Any | None:
+		if self.period == "yesterday":
+			return self.coordinator.get_yesterday_schedule(self.pupil_id)
+		if self.period == "today":
+			return self.coordinator.get_today_schedule(self.pupil_id)
+		if self.period == "tomorrow":
+			return self.coordinator.get_tomorrow_schedule(self.pupil_id)
+		return None
+
+	@property
+	def native_value(self) -> str:
+		if self.period == "week":
+			return week_summary(
+				self.coordinator.get_pupil_schedule(self.pupil_id),
+				datetime.now().date(),
+			)
+		return schedule_day_summary(self._day())
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		attributes = {
+			ATTR_PUPIL_ID: self.pupil_id,
+			ATTR_PUPIL_NAME: self.pupil_name,
+			"period": self.period,
+		}
+		if self.period == "week":
+			attributes["week_definition"] = "Sunday through Saturday"
+			attributes["schedule_days"] = InfoMentorScheduleSensor(
+				self.coordinator, self.config_entry, self.pupil_id
+			).extra_state_attributes.get("schedule_days", [])
+			return attributes
+
+		day = self._day()
+		if day:
+			attributes["date"] = day.date.strftime("%Y-%m-%d")
+			attributes["classes"] = [
+				{
+					"subject": entry.subject or entry.title,
+					"start_time": entry.start_time.strftime("%H:%M") if entry.start_time else None,
+					"end_time": entry.end_time.strftime("%H:%M") if entry.end_time else None,
+					"teacher": entry.teacher,
+					"classroom": entry.room,
+				}
+				for entry in day.timetable_entries
+			]
 		return attributes
 
 

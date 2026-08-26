@@ -41,6 +41,9 @@ SENSOR_DASHBOARD = "dashboard"
 SENSOR_DATA_FRESHNESS = "data_freshness"
 SENSOR_NOTIFICATIONS = "notifications"
 SENSOR_DIAGNOSTIC_LOG = "diagnostic_log"
+SENSOR_HOMEWORK_SUMMARY = "homework_summary"
+SENSOR_NEWS_SUMMARY = "news_summary"
+SENSOR_SCHEDULE_SUMMARY = "schedule_summary"
 
 # Button entities
 BUTTON_DIAGNOSTICS_REFRESH = "diagnostics_refresh"
