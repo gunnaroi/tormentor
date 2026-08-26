@@ -1,8 +1,8 @@
-# InfoMentor Home Assistant Integration
+# InfoMentor Iceland Home Assistant Integration
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Vortitron&repository=im-tools&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=gunnaroi&repository=tormentor&category=integration)
 
-This custom component integrates InfoMentor school communication platform with Home Assistant, providing real-time access to school schedules, news, and timeline entries for your children.
+This custom component integrates the Icelandic InfoMentor school communication platform with Home Assistant, providing access to school schedules, news, and timeline entries for your children. It signs in through `im1.infomentor.is` and uses the modern services at `im.infomentor.is`.
 
 ## Features
 
@@ -63,7 +63,7 @@ This ensures accurate classification even when timetable data is temporarily una
 ### Option 1: HACS (Recommended)
 1. Install HACS if you haven't already
 2. Add this repository as a custom repository in HACS
-3. Install "InfoMentor" from HACS
+3. Install "InfoMentor Iceland" from HACS
 4. Restart Home Assistant
 
 ### Option 2: Manual Installation
@@ -76,12 +76,12 @@ This ensures accurate classification even when timetable data is temporarily una
 ### Initial Setup
 1. Go to **Settings** → **Devices & Services**
 2. Click **Add Integration** 
-3. Search for "InfoMentor"
+3. Search for "InfoMentor Iceland"
 4. Enter your InfoMentor credentials
 5. The integration will discover all your children automatically
 
 ### Important Notes
-- **Credentials**: Use the same username/password you use for the InfoMentor website
+- **Credentials**: Use the same username/password you use at `im1.infomentor.is`
 - **Multiple Children**: All children associated with your account are automatically added
 - **Updates**: Schedule data updates every 30 minutes by default
 - **Authentication**: Sessions are managed automatically with re-authentication as needed
@@ -442,4 +442,4 @@ logger:
 
 ## Support
 
-For issues and feature requests, please check the logs first and include relevant debug information when reporting problems. 
+For issues and feature requests, please check the logs first and include relevant debug information when reporting problems.

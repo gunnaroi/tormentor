@@ -185,7 +185,7 @@ class InfoMentorNotification:
 	@property
 	def full_url(self) -> str:
 		"""Build a complete URL for the notification."""
-		base = "https://hub.infomentor.se"
+		base = "https://im.infomentor.is"
 		raw = self.url
 		if raw.startswith("http"):
 			return raw
@@ -238,4 +238,4 @@ class ScheduleDay:
 			times.extend([entry.end_time for entry in self.timetable_entries if entry.end_time])
 		if self.time_registrations:
 			times.extend([entry.end_time for entry in self.time_registrations if entry.end_time])
-		return max(times) if times else None 
+		return max(times) if times else None

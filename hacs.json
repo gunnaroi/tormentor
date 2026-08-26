@@ -1,9 +1,9 @@
 {
-	"name": "InfoMentor",
+	"name": "InfoMentor Iceland",
 	"content_in_root": false,
-	"country": ["SE"],
+	"country": ["IS"],
 	"domain": "infomentor",
 	"iot_class": "cloud_polling",
 	"render_readme": true,
 	"zip_release": false
-} 
+}

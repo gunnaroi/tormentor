@@ -35,6 +35,8 @@ PASSWORD_FIELD_HINTS = (
 	"lykilord",
 	"losenord",
 	"txtlykilord",
+	"lykilorð",
+	"txtlykilorð",
 )
 SUBMIT_FIELD_HINTS = (
 	"login",
@@ -44,6 +46,7 @@ SUBMIT_FIELD_HINTS = (
 	"authenticate",
 	"next",
 	"continue",
+	"innskrá",
 )
 
 USERNAME_INPUT_TYPES = {"text", "email"}
@@ -417,4 +420,3 @@ def _replace_field(form_fields: List[Tuple[str, str]], field_name: str, value: s
 
 	if not replaced:
 		form_fields.append((field_name, value))
-

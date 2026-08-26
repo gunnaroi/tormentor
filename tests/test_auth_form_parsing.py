@@ -102,3 +102,31 @@ def test_extract_hidden_fields_captures_viewstate_and_idp_fields():
 	assert ("__EVENTVALIDATION", "validation") in hidden_fields
 	assert any(name.endswith("$url") for name, _ in hidden_fields)
 
+
+def test_builds_payload_for_icelandic_im1_login_form():
+	"""The production Icelandic WebForms login fields are recognised."""
+	html = """
+	<form name="mainForm" method="post" action="./" id="mainForm">
+		<input type="hidden" name="__VIEWSTATE" value="state" />
+		<input type="hidden" name="__EVENTVALIDATION" value="validation" />
+		<input name="login_ascx$txtNotandanafn" type="text"
+			id="login_ascx_txtNotandanafn" placeholder="Notandanafn" />
+		<input name="login_ascx$txtLykilord" type="password"
+			id="login_ascx_txtLykilord" placeholder="Lykilorð" />
+		<input type="submit" name="login_ascx$btnLogin" value="Innskrá" />
+	</form>
+	"""
+
+	login_form = select_login_form(parse_forms(html))
+	assert login_form is not None
+
+	fields, username_field, password_field, submit_field = build_login_form_data(
+		login_form, "notandi", "leynilegt"
+	)
+
+	assert ("login_ascx$txtNotandanafn", "notandi") in fields
+	assert ("login_ascx$txtLykilord", "leynilegt") in fields
+	assert ("login_ascx$btnLogin", "Innskrá") in fields
+	assert username_field == "login_ascx$txtNotandanafn"
+	assert password_field == "login_ascx$txtLykilord"
+	assert submit_field == "login_ascx$btnLogin"

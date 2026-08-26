@@ -15,9 +15,12 @@ from .form_utils import ParsedForm, build_login_form_data, extract_hidden_fields
 
 _LOGGER = logging.getLogger(__name__)
 
-HUB_BASE_URL = "https://hub.infomentor.se"
-MODERN_BASE_URL = "https://im.infomentor.se"
-LEGACY_BASE_URL = "https://infomentor.se/swedish/production/mentor/"
+# The Icelandic installation does not have a separate ``hub`` host. The
+# controllers used by the SPA live on im.infomentor.is, while the IM1 login
+# and legacy pages live on im1.infomentor.is.
+HUB_BASE_URL = "https://im.infomentor.is"
+MODERN_BASE_URL = HUB_BASE_URL
+LEGACY_BASE_URL = "https://im1.infomentor.is/production/mentor/"
 
 OAUTH_LOGIN_URL = f"{HUB_BASE_URL}/Authentication/Authentication/Login?apiType=IM1&forceOAuth=true"
 OAUTH_LOGIN_URL_WITH_INSTANCE = f"{OAUTH_LOGIN_URL}&apiInstance="
@@ -35,7 +38,7 @@ REQUEST_DELAY = 0.3  # Reduced from 0.8s to 0.3s - mobile apps are typically fas
 DEFAULT_HEADERS = {
 	"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
 	"Accept-Encoding": "gzip, deflate, br, zstd",
-	"Accept-Language": "sv-SE,sv;q=0.9,en-US;q=0.8,en;q=0.7",
+	"Accept-Language": "is-IS,is;q=0.9,en-US;q=0.8,en;q=0.7",
 	"Cache-Control": "no-cache",
 	"Connection": "keep-alive",
 	"Pragma": "no-cache",
@@ -235,7 +238,7 @@ def _choose_best_school_option(
 		
 		# Real kommun/municipality entries should score highest
 		# Most users authenticate to their local kommun, not demo/test sites
-		if 'kommun' in lower_title:
+		if 'kommun' in lower_title or 'sveitarfélag' in lower_title:
 			score += 200  # Increased significantly - real municipalities
 		
 		# Penalize demo/test entries heavily - most users don't want these
@@ -249,19 +252,19 @@ def _choose_best_school_option(
 		# User type indicators (but lower priority than kommun)
 		if 'elever' in lower_title or 'student' in lower_title or 'students' in lower_title:
 			score += 30
-		if 'vårdnadshavare' in lower_title or 'vardnadshavare' in lower_title or 'parent' in lower_title:
+		if any(term in lower_title for term in ('vårdnadshavare', 'vardnadshavare', 'parent', 'foreldri', 'forráðamaður')):
 			score += 25
 		if 'pupil' in lower_title:
 			score += 20
-		if 'personal' in lower_title or 'staff' in lower_title:
+		if 'personal' in lower_title or 'staff' in lower_title or 'starfsfólk' in lower_title:
 			score += 15
 		
 		# School type indicators
-		if 'skola' in lower_title or 'school' in lower_title:
+		if 'skola' in lower_title or 'school' in lower_title or 'skóli' in lower_title:
 			score += 10
 		if 'barn' in lower_title:
 			score += 5
-		if 'förskola' in lower_title or 'forskola' in lower_title:
+		if any(term in lower_title for term in ('förskola', 'forskola', 'leikskóli')):
 			score += 5
 
 		# URL scoring - prefer standard SSO URLs used by most municipalities
@@ -279,8 +282,8 @@ def _choose_best_school_option(
 			score -= 300  # Heavy penalty for demo URLs
 		if 'test' in lower_url and 'mentor.is' in lower_url:
 			score -= 250  # Heavy penalty for test environments
-		if 'mentor.is' in lower_url and 'demo' not in lower_url and 'test' not in lower_url:
-			score -= 50  # Slight penalty for .is domain (Icelandic, less common for Swedish users)
+		if 'infomentor.is' in lower_url and 'demo' not in lower_url and 'test' not in lower_url:
+			score += 150  # Production Icelandic InfoMentor endpoint
 		
 		# External IdP URLs (kommun-specific auth servers)
 		if lower_url.startswith('https://idp') or '://idp' in lower_url:
@@ -354,6 +357,7 @@ class InfoMentorAuth:
 		self._username: Optional[str] = None
 		self._password: Optional[str] = None
 		self._preferred_school_number: Optional[str] = None
+		self._last_login_html: Optional[str] = None
 		
 	def _backup_auth_cookies(self) -> None:
 		"""Backup authentication cookies for potential restoration."""
@@ -363,7 +367,7 @@ class InfoMentorAuth:
 				try:
 					# Check if this is an InfoMentor-related cookie
 					domain = str(cookie.get('domain', '')) if hasattr(cookie, 'get') else str(getattr(cookie, 'domain', ''))
-					if any(infomentor_domain in domain for infomentor_domain in ['infomentor.se', '.infomentor.se']):
+					if any(infomentor_domain in domain for infomentor_domain in ['infomentor.is', '.infomentor.is']):
 						# Handle different cookie formats safely
 						cookie_name = None
 						cookie_value = None
@@ -614,31 +618,19 @@ class InfoMentorAuth:
 				except Exception as pref_err:
 					_LOGGER.debug(f"Could not apply stored IdP preference: {pref_err}")
 			
-			# Step 1: Get OAuth token (primary method)
-			_LOGGER.info("Step 1: Getting OAuth token")
-			try:
-				oauth_token = await self._get_oauth_token()
-				_LOGGER.info("OAuth token obtained: %s", bool(oauth_token))
-
-				if oauth_token:
-					_LOGGER.info("Step 2: Completing OAuth flow")
-					await self._complete_oauth_to_modern_domain(oauth_token, username, password)
-					_LOGGER.info("Step 2 completed")
-				else:
-					_LOGGER.warning("No OAuth token — trying direct login fallback")
-					await self._direct_login_with_credentials(username, password)
-			except Exception as oauth_err:
-				_LOGGER.warning("OAuth flow failed (%s) — trying direct login fallback", oauth_err)
-				try:
-					await self._direct_login_with_credentials(username, password)
-					_LOGGER.info("Direct login fallback completed")
-				except Exception as fallback_err:
-					_LOGGER.error("All login methods failed: oauth=%s, fallback=%s", oauth_err, fallback_err)
-					raise oauth_err
+			# Iceland uses the classic IM1 credential form directly. Unlike the
+			# Swedish deployment it does not begin with a hub OAuth exchange.
+			_LOGGER.info("Step 1: Logging in through the Icelandic IM1 portal")
+			await self._direct_login_with_credentials(username, password)
 			
-			# Step 3: Get pupil IDs from modern interface
-			_LOGGER.info("Step 3: Getting pupil IDs from dashboard")
-			self.pupil_ids = await self._get_pupil_ids_modern()
+			# The Icelandic IM1 response can contain the pupils directly. Prefer
+			# that response before asking the modern application for the same data.
+			_LOGGER.info("Step 2: Getting pupil IDs from the Icelandic dashboard")
+			self.pupil_ids = []
+			if self._last_login_html:
+				self.pupil_ids = await self._extract_pupil_ids_legacy(self._last_login_html)
+			if not self.pupil_ids:
+				self.pupil_ids = await self._get_pupil_ids_modern()
 			
 			# Step 4: Get switch ID mappings
 			_LOGGER.info("Step 4: Building switch ID mappings")
@@ -890,9 +882,9 @@ class InfoMentorAuth:
 		
 		# Common dashboard URLs to try
 		dashboard_urls = [
-			f"https://infomentor.se/Swedish/Production/mentor/",
-			f"https://hub.infomentor.se/",
-			f"https://hub.infomentor.se/home",
+			LEGACY_BASE_URL,
+			f"{HUB_BASE_URL}/",
+			f"{HUB_BASE_URL}/home",
 		]
 		
 		headers = DEFAULT_HEADERS.copy()
@@ -1029,7 +1021,7 @@ class InfoMentorAuth:
 		else:
 			success_indicators = [
 				"default.aspx" in final_url.lower(),
-				"hub.infomentor.se" in final_url.lower(),
+				"im.infomentor.is" in final_url.lower(),
 				"logout" in cred_text.lower(),
 				"dashboard" in cred_text.lower(),
 			]
@@ -1050,7 +1042,7 @@ class InfoMentorAuth:
 		headers = DEFAULT_HEADERS.copy()
 		headers.update({
 			"Content-Type": "application/x-www-form-urlencoded",
-			"Origin": "https://infomentor.se",
+			"Origin": "https://im1.infomentor.is",
 			"Referer": LEGACY_BASE_URL,
 			"Sec-Fetch-Site": "same-origin",
 			"Sec-Fetch-Dest": "document",
@@ -1108,7 +1100,7 @@ class InfoMentorAuth:
 		try:
 			self.session.cookie_jar.update_cookies(
 				{"Im1_Ck_LastUsedIdp": str(school_number)},
-				response_url="https://infomentor.se/swedish/production/mentor/",
+				response_url=LEGACY_BASE_URL,
 			)
 			_LOGGER.debug(f"Set Im1_Ck_LastUsedIdp cookie to {school_number}")
 		except Exception as cookie_err:
@@ -1397,7 +1389,10 @@ class InfoMentorAuth:
 		"""Login directly using username/password on the main InfoMentor login page."""
 		_LOGGER.debug("*** STARTING DIRECT LOGIN v0.0.51 ***")
 
-		login_url = LEGACY_BASE_URL
+		# Begin at the modern application. It redirects to IM1 with return-state
+		# cookies, allowing a successful credential post to establish both the
+		# modern and legacy sessions just like a browser login.
+		login_url = f"{MODERN_BASE_URL}/"
 		headers = DEFAULT_HEADERS.copy()
 
 		try:
@@ -1444,6 +1439,7 @@ class InfoMentorAuth:
 
 			await _write_text_file_async("/tmp/infomentor_login_result.html", login_result)
 			_LOGGER.debug("*** SAVED LOGIN RESULT v0.0.51 *** /tmp/infomentor_login_result.html")
+			self._last_login_html = login_result
 
 			success_indicators = [
 				"student-menu",
@@ -1452,6 +1448,7 @@ class InfoMentorAuth:
 				"mentor-main",
 				"logout",
 				"logga ut",
+				"skrá út",
 			]
 
 			is_success = any(indicator in login_result.lower() for indicator in success_indicators)
@@ -1465,6 +1462,9 @@ class InfoMentorAuth:
 					"failed",
 					"invalid",
 					"wrong",
+					"rangt notandanafn",
+					"rangt lykilorð",
+					"innskráning mistókst",
 				]
 
 				has_error = any(indicator in login_result.lower() for indicator in error_indicators)
@@ -1488,7 +1488,7 @@ class InfoMentorAuth:
 			f"{HUB_BASE_URL}/",
 			f"{HUB_BASE_URL}/#/",
 			f"{MODERN_BASE_URL}/",
-			"https://infomentor.se/Swedish/Production/mentor/default.aspx"
+			f"{LEGACY_BASE_URL}default.aspx"
 		]
 		
 		for endpoint in test_endpoints:
@@ -1521,16 +1521,15 @@ class InfoMentorAuth:
 	async def _establish_cross_domain_sessions(self) -> None:
 		"""Visit key InfoMentor domains after auth to propagate session cookies.
 
-		The OAuth/WS-Fed flow establishes cookies on hub.infomentor.se, but
-		API calls to im.infomentor.se and legacy infomentor.se need their own
+		The login flow establishes cookies on im1.infomentor.is, but API calls
+		to im.infomentor.is need their own
 		cookies.  Visiting each domain with allow_redirects lets the server
 		issue the necessary set-cookie headers, mirroring what a browser does
 		when the SPA loads resources from multiple subdomains.
 		"""
 		domains_to_visit = [
-			(f"{MODERN_BASE_URL}/", "im.infomentor.se"),
-			(f"{HUB_BASE_URL}/", "hub.infomentor.se"),
-			(f"{LEGACY_BASE_URL}", "legacy infomentor.se"),
+			(f"{MODERN_BASE_URL}/", "modern infomentor.is"),
+			(f"{LEGACY_BASE_URL}", "legacy infomentor.is"),
 		]
 
 		headers = DEFAULT_HEADERS.copy()
@@ -1625,7 +1624,7 @@ class InfoMentorAuth:
 						_LOGGER.debug(f"*** AUTO-SUBMIT ACTION URL v0.0.64 *** {action_url}")
 						
 						# If it would take us to legacy, try alternative approaches first
-						if "infomentor.se/swedish/production/mentor" in action_url.lower():
+						if "im1.infomentor.is/production/mentor" in action_url.lower():
 							_LOGGER.debug("*** AUTO-SUBMIT LEADS TO LEGACY - TRYING ALTERNATIVES v0.0.64 ***")
 							
 							# Strategy 1: Try multiple hub URLs to find one that works
@@ -1730,7 +1729,7 @@ class InfoMentorAuth:
 				if self._has_hub_payload(text):
 					_LOGGER.debug("*** HUB PAYLOAD DETECTED - USING HUB JSON EXTRACTION v0.0.70 ***")
 					pupil_ids = self._extract_pupil_ids_from_json(text)
-				elif "infomentor.se/swedish/production/mentor/" in str(resp.url) or "mentor/" in text:
+				elif "im1.infomentor.is/production/mentor/" in str(resp.url).lower() or "mentor/" in text:
 					_LOGGER.debug("*** DETECTED LEGACY INTERFACE - USING LEGACY EXTRACTION v0.0.70 ***")
 					pupil_ids = await self._extract_pupil_ids_legacy(text)
 				else:
@@ -1780,7 +1779,7 @@ class InfoMentorAuth:
 							if self._has_hub_payload(alt_text):
 								_LOGGER.debug("*** HUB PAYLOAD DETECTED FROM ALT URL - USING HUB JSON EXTRACTION v0.0.70 ***")
 								pupil_ids = self._extract_pupil_ids_from_json(alt_text)
-							elif "infomentor.se/swedish/production/mentor/" in str(alt_resp.url) or "mentor/" in alt_text:
+							elif "im1.infomentor.is/production/mentor/" in str(alt_resp.url).lower() or "mentor/" in alt_text:
 								_LOGGER.debug("*** DETECTED LEGACY INTERFACE FROM ALT URL - USING LEGACY EXTRACTION v0.0.70 ***")
 								pupil_ids = await self._extract_pupil_ids_legacy(alt_text)
 							else:
@@ -2145,7 +2144,7 @@ class InfoMentorAuth:
 		"""Old legacy extraction method as fallback."""
 		try:
 			# Try the legacy default page
-			legacy_url = "https://infomentor.se/swedish/production/mentor/default.aspx"
+			legacy_url = f"{LEGACY_BASE_URL}default.aspx"
 			await asyncio.sleep(REQUEST_DELAY)
 			async with self.session.get(legacy_url, headers=DEFAULT_HEADERS) as resp:
 				if resp.status == 200:
@@ -2322,7 +2321,7 @@ class InfoMentorAuth:
 			"hub_root": f"{HUB_BASE_URL}/",
 			"hub_hash": f"{HUB_BASE_URL}/#/",
 			"modern_root": f"{MODERN_BASE_URL}/",
-			"legacy_default": "https://infomentor.se/Swedish/Production/mentor/default.aspx"
+			"legacy_default": f"{LEGACY_BASE_URL}default.aspx"
 		}
 		
 		for name, url in test_endpoints.items():
@@ -2370,4 +2369,4 @@ class InfoMentorAuth:
 		if diagnostics["errors"]:
 			_LOGGER.warning(f"  - Errors encountered: {len(diagnostics['errors'])}")
 		
-		return diagnostics 
+		return diagnostics
