@@ -1,0 +1,44 @@
+{
+	"title": "InfoMentor Ísland",
+	"config": {
+		"abort": {
+			"already_configured": "Þessi InfoMentor-aðgangur er þegar skráður.",
+			"reauth_successful": "Endurinnskráning tókst.",
+			"wrong_account": "Innskráningarupplýsingarnar tilheyra öðrum InfoMentor-aðgangi."
+		},
+		"error": {
+			"cannot_connect": "Ekki náðist samband við InfoMentor. Athugaðu nettenginguna og reyndu aftur.",
+			"invalid_auth": "Rangt notandanafn eða lykilorð.",
+			"unknown": "Óvænt villa kom upp."
+		},
+		"step": {
+			"reauth_confirm": {
+				"data": {
+					"password": "Lykilorð",
+					"username": "Notandanafn eða netfang"
+				},
+				"description": "Sláðu inn nýjar innskráningarupplýsingar fyrir {username}.",
+				"title": "Endurtengja InfoMentor Ísland"
+			},
+			"user": {
+				"data": {
+					"password": "Lykilorð",
+					"username": "Notandanafn eða netfang"
+				},
+				"description": "Sláðu inn sömu upplýsingar og þú notar á im1.infomentor.is.",
+				"title": "Setja upp InfoMentor Ísland"
+			}
+		}
+	},
+	"options": {
+		"step": {
+			"init": {
+				"data": {
+					"notify_services": "Tilkynningaþjónustur (aðskildar með kommum)"
+				},
+				"description": "Stilltu tilkynningaþjónustur Home Assistant. Innskráningarupplýsingar eru uppfærðar með endurinnskráningu Home Assistant.",
+				"title": "Valkostir InfoMentor Ísland"
+			}
+		}
+	}
+}

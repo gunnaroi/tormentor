@@ -903,21 +903,9 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			finally:
 				self.client = None
 				
-		# Don't close the session if it's managed by Home Assistant
-		# The session is from async_get_clientsession which is managed by HA
-		if self._session and not self._session.closed and hasattr(self._session, '_connector'):
-			# Only close if this is a session we created ourselves, not HA's managed session
-			try:
-				# Check if this session has a connector we control
-				if hasattr(self._session._connector, '_close'):
-					await self._session.close()
-			except Exception as err:
-				_LOGGER.debug(f"Session cleanup note: {err}")
-			finally:
-				self._session = None
-		else:
-			# Just clear the reference for HA-managed sessions
-			self._session = None
+		# The session comes from async_get_clientsession and is owned by Home
+		# Assistant. Drop our reference without closing the shared session.
+		self._session = None
 			
 	async def async_refresh_pupil_data(self, pupil_id: str) -> None:
 		"""Refresh data for a specific pupil."""

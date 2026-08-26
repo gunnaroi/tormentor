@@ -12,6 +12,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from . import InfoMentorConfigEntry
 from .const import (
 	DOMAIN,
 	CONF_USERNAME,
@@ -51,12 +52,12 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(
 	hass: HomeAssistant,
-	config_entry: ConfigEntry,
+	config_entry: InfoMentorConfigEntry,
 	async_add_entities: AddEntitiesCallback,
 ) -> None:
 	"""Set up InfoMentor sensors based on a config entry."""
 	try:
-		coordinator: InfoMentorDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+		coordinator = config_entry.runtime_data
 		
 		entities: List[SensorEntity] = []
 		

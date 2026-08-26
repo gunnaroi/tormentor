@@ -15,11 +15,10 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from homeassistant.components.diagnostics import async_redact_data
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_PASSWORD, CONF_USERNAME, DOMAIN
-from .coordinator import InfoMentorDataUpdateCoordinator
+from . import InfoMentorConfigEntry
+from .const import CONF_PASSWORD, CONF_USERNAME
 
 
 REDACT_KEYS = {CONF_PASSWORD, "password", "token", "cookie", "cookies", "set-cookie"}
@@ -27,12 +26,10 @@ REDACT_KEYS = {CONF_PASSWORD, "password", "token", "cookie", "cookies", "set-coo
 
 async def async_get_config_entry_diagnostics(
 	hass: HomeAssistant,
-	entry: ConfigEntry,
+	entry: InfoMentorConfigEntry,
 ) -> Dict[str, Any]:
 	"""Return diagnostics for the given config entry."""
-	coordinator: InfoMentorDataUpdateCoordinator | None = (
-		hass.data.get(DOMAIN, {}).get(entry.entry_id)
-	)
+	coordinator = entry.runtime_data
 
 	payload: Dict[str, Any] = {
 		"entry": {

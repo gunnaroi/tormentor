@@ -1,7 +1,7 @@
 {
 	"domain": "infomentor",
 	"name": "InfoMentor Iceland",
-	"codeowners": ["@Vortitron"],
+	"codeowners": ["@gunnaroi"],
 	"config_flow": true,
 	"dependencies": [],
 	"documentation": "https://github.com/gunnaroi/tormentor",
@@ -9,5 +9,5 @@
 	"iot_class": "cloud_polling",
 	"issue_tracker": "https://github.com/gunnaroi/tormentor/issues",
 	"requirements": ["aiohttp>=3.8.0", "beautifulsoup4>=4.11.0"],
-	"version": "0.2.0"
+	"version": "0.2.1"
 }

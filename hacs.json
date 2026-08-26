@@ -3,6 +3,7 @@
 	"content_in_root": false,
 	"country": ["IS"],
 	"domain": "infomentor",
+	"homeassistant": "2025.3.0",
 	"iot_class": "cloud_polling",
 	"render_readme": true,
 	"zip_release": false

@@ -7,6 +7,7 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.const import CONF_USERNAME, CONF_PASSWORD
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -28,6 +29,14 @@ class InfoMentorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 	"""Handle a config flow for InfoMentor."""
 	
 	VERSION = 1
+
+	@staticmethod
+	@callback
+	def async_get_options_flow(
+		config_entry: config_entries.ConfigEntry,
+	) -> config_entries.OptionsFlow:
+		"""Create the options flow."""
+		return InfoMentorOptionsFlow()
 	
 	async def async_step_user(
 		self, user_input: Optional[Dict[str, Any]] = None
@@ -65,10 +74,17 @@ class InfoMentorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 		)
 	
 	async def async_step_reauth(
+		self, entry_data: Dict[str, Any]
+	) -> FlowResult:
+		"""Start re-authentication for an existing entry."""
+		return await self.async_step_reauth_confirm()
+
+	async def async_step_reauth_confirm(
 		self, user_input: Optional[Dict[str, Any]] = None
 	) -> FlowResult:
-		"""Handle re-authentication."""
+		"""Validate replacement credentials and update the existing entry."""
 		errors: Dict[str, str] = {}
+		reauth_entry = self._get_reauth_entry()
 		
 		if user_input is not None:
 			try:
@@ -84,29 +100,15 @@ class InfoMentorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 				_LOGGER.exception("Unexpected exception during reauth")
 				errors["base"] = "unknown"
 			else:
-				# Update the existing entry with new credentials
-				existing_entry = await self.async_set_unique_id(user_input[CONF_USERNAME])
-				if existing_entry:
-					self.hass.config_entries.async_update_entry(
-						existing_entry, data=user_input
-					)
-					await self.hass.config_entries.async_reload(existing_entry.entry_id)
-					return self.async_abort(reason="reauth_successful")
-				else:
-					# If no existing entry found, create a new one
-					return self.async_create_entry(
-						title=f"InfoMentor ({user_input[CONF_USERNAME]})",
-						data=user_input,
-					)
+				await self.async_set_unique_id(user_input[CONF_USERNAME])
+				self._abort_if_unique_id_mismatch(reason="wrong_account")
+				return self.async_update_reload_and_abort(
+					reauth_entry,
+					data_updates=user_input,
+				)
 		
 		# Show the reauth form with current username pre-filled if available
-		current_username = self.context.get("source_entry_id")
-		if current_username:
-			# Try to get the existing username from the entry
-			for entry in self.hass.config_entries.async_entries(DOMAIN):
-				if entry.entry_id == current_username:
-					current_username = entry.data.get(CONF_USERNAME, "")
-					break
+		current_username = reauth_entry.data.get(CONF_USERNAME, "")
 		
 		schema = vol.Schema({
 			vol.Required(CONF_USERNAME, default=current_username or ""): str,
@@ -114,7 +116,7 @@ class InfoMentorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 		})
 		
 		return self.async_show_form(
-			step_id="reauth",
+			step_id="reauth_confirm",
 			data_schema=schema,
 			errors=errors,
 			description_placeholders={"username": current_username or ""},
@@ -134,63 +136,20 @@ class InfoMentorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class InfoMentorOptionsFlow(config_entries.OptionsFlow):
 	"""Handle InfoMentor options."""
 
-	def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-		"""Initialise options flow."""
-		self.config_entry = config_entry
-
 	async def async_step_init(
 		self, user_input: Optional[Dict[str, Any]] = None
 	) -> FlowResult:
-		"""Manage options: credentials and notification settings."""
-		errors: Dict[str, str] = {}
-		current_username = self.config_entry.data.get(CONF_USERNAME, "")
+		"""Manage notification settings."""
 		current_notify = self.config_entry.options.get(CONF_NOTIFY_SERVICES, "")
 
 		if user_input is not None:
-			username = user_input.get(CONF_USERNAME, current_username)
-			password = user_input.get(CONF_PASSWORD)
-			notify_services = user_input.get(CONF_NOTIFY_SERVICES, "")
-
-			if not password:
-				errors["base"] = "invalid_auth"
-			else:
-				try:
-					session = async_get_clientsession(self.hass)
-					from .infomentor.client import InfoMentorClient
-					async with InfoMentorClient(session) as client:
-						await client.login(username, password)
-				except InfoMentorAuthError:
-					errors["base"] = "invalid_auth"
-				except InfoMentorConnectionError:
-					errors["base"] = "cannot_connect"
-				except Exception:
-					_LOGGER.exception("Unexpected exception during credentials test in options")
-					errors["base"] = "unknown"
-				else:
-					new_data = dict(self.config_entry.data)
-					new_data[CONF_USERNAME] = username
-					new_data[CONF_PASSWORD] = password
-					self.hass.config_entries.async_update_entry(
-						self.config_entry,
-						data=new_data,
-						options={CONF_NOTIFY_SERVICES: notify_services},
-					)
-					await self.hass.config_entries.async_reload(self.config_entry.entry_id)
-					return self.async_create_entry(title="", data={CONF_NOTIFY_SERVICES: notify_services})
+			return self.async_create_entry(title="", data=user_input)
 
 		schema = vol.Schema({
-			vol.Required(CONF_USERNAME, default=current_username): str,
-			vol.Required(CONF_PASSWORD): str,
 			vol.Optional(CONF_NOTIFY_SERVICES, default=current_notify): str,
 		})
 
 		return self.async_show_form(
 			step_id="init",
 			data_schema=schema,
-			errors=errors,
 		)
-
-
-async def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
-	"""Return the options flow for this handler."""
-	return InfoMentorOptionsFlow(config_entry)

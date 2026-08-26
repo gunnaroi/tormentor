@@ -60,6 +60,8 @@ This ensures accurate classification even when timetable data is temporarily una
 
 ## Installation
 
+Requires Home Assistant 2025.3.0 or newer.
+
 ### Option 1: HACS (Recommended)
 1. Install HACS if you haven't already
 2. Add this repository as a custom repository in HACS
@@ -89,9 +91,9 @@ This ensures accurate classification even when timetable data is temporarily una
 
 ### Updating Credentials and Testing Login
 
-- You can update your InfoMentor username/password via the integration's Options.
-- The options form validates the credentials against InfoMentor before saving.
-- On success, the integration reloads immediately with the new credentials.
+- Home Assistant automatically opens a re-authentication flow when stored credentials stop working.
+- Use **Configure** to select notification services; credentials are kept in the protected config entry data.
+- Successful re-authentication updates and reloads the existing entry without creating duplicate devices.
 
 ### Diagnostics (manual retry)
 
@@ -180,7 +182,7 @@ This service resets authentication failure tracking and attempts immediate re-au
 
 ### Session Reuse & Stale Data Retries
 
-- **Cookie reuse**: The integration now persists the InfoMentor session cookies to Home Assistant storage. On restart (or after temporary network hiccups) we attempt to restore the previous session before running the full OAuth dance, so successful logins stay alive much longer.
+- **Cookie reuse**: The integration persists InfoMentor session cookies to Home Assistant storage. On restart or after temporary network issues, it attempts to restore the previous session before performing a full login.
 - **Stale data handling**: When the last successful data pull is older than 24 hours we automatically move into an hourly retry cadence with a randomly offset start time (between +3 and +17 minutes past the hour). This avoids colliding with InfoMentor’s on-the-hour maintenance jobs and keeps trying until fresh data arrives.
 
 ### Manual Actions (Developer Tools → Actions)

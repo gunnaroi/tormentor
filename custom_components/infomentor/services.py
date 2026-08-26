@@ -28,18 +28,6 @@ _LOGGER = logging.getLogger(__name__)
 
 CoordinatorAction = Callable[[str, InfoMentorDataUpdateCoordinator, ServiceCall], Awaitable[None]]
 
-_SERVICES_REGISTERED = False
-_REGISTERED_SERVICES = (
-	SERVICE_REFRESH_DATA,
-	SERVICE_SWITCH_PUPIL,
-	SERVICE_FORCE_REFRESH,
-	SERVICE_DEBUG_AUTH,
-	SERVICE_CLEANUP_DUPLICATES,
-	SERVICE_RETRY_AUTH,
-	SERVICE_DIAGNOSTIC_POKE,
-)
-
-
 def _build_schema(extra: dict) -> vol.Schema:
 	"""Helper to build schemas with shared optional fields."""
 	fields: dict = {vol.Optional("config_entry_id"): str}
@@ -77,9 +65,7 @@ SERVICE_DIAGNOSTIC_POKE_SCHEMA = _build_schema({
 
 async def async_register_services(hass: HomeAssistant) -> None:
 	"""Register InfoMentor services once per Home Assistant instance."""
-	global _SERVICES_REGISTERED
-	
-	if _SERVICES_REGISTERED:
+	if hass.services.has_service(DOMAIN, SERVICE_REFRESH_DATA):
 		return
 	
 	async def handle_refresh_data(call: ServiceCall) -> None:
@@ -153,20 +139,6 @@ async def async_register_services(hass: HomeAssistant) -> None:
 		schema=SERVICE_DIAGNOSTIC_POKE_SCHEMA,
 	)
 	
-	_SERVICES_REGISTERED = True
-
-
-async def async_unregister_services(hass: HomeAssistant) -> None:
-	"""Remove InfoMentor services when the last entry is unloaded."""
-	global _SERVICES_REGISTERED
-	
-	if not _SERVICES_REGISTERED:
-		return
-	
-	for service in _REGISTERED_SERVICES:
-		hass.services.async_remove(DOMAIN, service)
-	
-	_SERVICES_REGISTERED = False
 
 
 async def _run_for_targets(
@@ -199,14 +171,14 @@ async def _run_for_targets(
 
 def _get_target_entry_ids(hass: HomeAssistant, call: ServiceCall) -> set[str]:
 	"""Resolve which config entries should handle a service call."""
-	domain_data = hass.data.get(DOMAIN)
-	if not domain_data:
+	loaded_entries = hass.config_entries.async_loaded_entries(DOMAIN)
+	if not loaded_entries:
 		raise HomeAssistantError("InfoMentor is not currently set up.")
 	
 	coordinators = {
-		entry_id: coordinator
-		for entry_id, coordinator in domain_data.items()
-		if isinstance(coordinator, InfoMentorDataUpdateCoordinator)
+		entry.entry_id: entry.runtime_data
+		for entry in loaded_entries
+		if isinstance(entry.runtime_data, InfoMentorDataUpdateCoordinator)
 	}
 	
 	if not coordinators:
@@ -242,10 +214,14 @@ def _get_target_coordinators(
 ) -> list[tuple[str, InfoMentorDataUpdateCoordinator]]:
 	"""Return coordinators that should process the service call."""
 	entry_ids = _get_target_entry_ids(hass, call)
-	domain_data = hass.data.get(DOMAIN, {})
+	entries = {
+		entry.entry_id: entry
+		for entry in hass.config_entries.async_loaded_entries(DOMAIN)
+	}
 	targets: list[tuple[str, InfoMentorDataUpdateCoordinator]] = []
 	for entry_id in entry_ids:
-		coordinator = domain_data.get(entry_id)
+		entry = entries.get(entry_id)
+		coordinator = entry.runtime_data if entry else None
 		if isinstance(coordinator, InfoMentorDataUpdateCoordinator):
 			targets.append((entry_id, coordinator))
 	return targets
@@ -474,4 +450,3 @@ async def _cleanup_duplicate_entities(
 	_LOGGER.info("Removed %d duplicate InfoMentor entities", len(to_remove))
 	if len(to_remove) > 0:
 		_LOGGER.info("Restart Home Assistant to allow entities to be recreated if required.")
-

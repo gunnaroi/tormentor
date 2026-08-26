@@ -1,0 +1,44 @@
+{
+	"title": "InfoMentor Iceland",
+	"config": {
+		"abort": {
+			"already_configured": "This InfoMentor account is already configured.",
+			"reauth_successful": "Re-authentication was successful.",
+			"wrong_account": "The credentials belong to a different InfoMentor account."
+		},
+		"error": {
+			"cannot_connect": "Unable to connect to InfoMentor. Check your internet connection and try again.",
+			"invalid_auth": "Invalid username or password.",
+			"unknown": "An unexpected error occurred."
+		},
+		"step": {
+			"reauth_confirm": {
+				"data": {
+					"password": "Password",
+					"username": "Username or email"
+				},
+				"description": "Enter new credentials for {username}.",
+				"title": "Reconnect InfoMentor Iceland"
+			},
+			"user": {
+				"data": {
+					"password": "Password",
+					"username": "Username or email"
+				},
+				"description": "Enter the credentials you use at im1.infomentor.is.",
+				"title": "Set up InfoMentor Iceland"
+			}
+		}
+	},
+	"options": {
+		"step": {
+			"init": {
+				"data": {
+					"notify_services": "Notification services (comma-separated)"
+				},
+				"description": "Configure Home Assistant notification services. Credentials are updated through Home Assistant's re-authentication flow.",
+				"title": "InfoMentor Iceland options"
+			}
+		}
+	}
+}

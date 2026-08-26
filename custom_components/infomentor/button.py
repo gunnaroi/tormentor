@@ -11,6 +11,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from . import InfoMentorConfigEntry
 from .const import (
 	BUTTON_DIAGNOSTICS_FULL,
 	BUTTON_DIAGNOSTICS_REFRESH,
@@ -24,11 +25,11 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(
 	hass: HomeAssistant,
-	config_entry: ConfigEntry,
+	config_entry: InfoMentorConfigEntry,
 	async_add_entities: AddEntitiesCallback,
 ) -> None:
 	"""Set up InfoMentor button entities."""
-	coordinator: InfoMentorDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+	coordinator = config_entry.runtime_data
 	async_add_entities(
 		[
 			InfoMentorDiagnosticsButton(coordinator, config_entry, clear_cache=False),
