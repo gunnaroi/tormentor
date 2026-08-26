@@ -80,3 +80,16 @@ def today_summary(day: Any | None) -> str:
 		else:
 			items.append(title)
 	return limited(", ".join(items), "No classes today")
+
+
+def attendance_summary(entries: list[dict[str, Any]]) -> str:
+	"""Return the latest historical attendance record as readable text."""
+	if not entries:
+		return "No attendance records"
+	entry = entries[0]
+	date_text = compact(entry.get("longDate") or entry.get("shortDate"))
+	time_text = compact(entry.get("time"))
+	subject = compact(entry.get("subject"))
+	reason = compact(entry.get("reason"))
+	details = " · ".join(value for value in (date_text, time_text, subject, reason) if value)
+	return limited(details, "Attendance record available")

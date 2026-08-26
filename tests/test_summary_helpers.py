@@ -34,6 +34,18 @@ class SummaryHelperTests(unittest.TestCase):
 		day = SimpleNamespace(timetable_entries=[entry], time_registrations=[])
 		self.assertEqual("09:00-09:40 Math", summary.today_summary(day))
 
+	def test_attendance_summary_uses_latest_record(self):
+		entries = [{
+			"longDate": "26 August 2026",
+			"time": "09:00",
+			"subject": "Math",
+			"reason": "Absent",
+		}]
+		self.assertEqual(
+			"26 August 2026 · 09:00 · Math · Absent",
+			summary.attendance_summary(entries),
+		)
+
 
 if __name__ == "__main__":
 	unittest.main()

@@ -127,6 +127,54 @@ class InfoMentorClient:
 			_LOGGER.error(f"Exception during pupil switch to {pupil_id}: {e}")
 			return False
 		
+	async def get_attendance(self, pupil_id: str) -> List[Dict[str, Any]]:
+		"""Get historical attendance records for a pupil.
+
+		Attendance is optional and deliberately isolated from schedule freshness.
+		"""
+		self._ensure_authenticated()
+		if not await self.switch_pupil(pupil_id):
+			raise InfoMentorAuthError("Could not select pupil for attendance")
+
+		app_data_url = f"{HUB_BASE_URL}/Attendance/Attendance/appData"
+		list_url = f"{HUB_BASE_URL}/Attendance/Attendance/GetAttendanceList"
+		headers = {
+			**DEFAULT_HEADERS,
+			"Accept": "application/json, text/javascript, */*; q=0.01",
+			"X-Requested-With": "XMLHttpRequest",
+			"Referer": f"{HUB_BASE_URL}/#/attendance/tab/pastAttendance",
+		}
+
+		async with self._session.post(app_data_url, headers=headers) as response:
+			if response.status in (401, 403):
+				raise InfoMentorAuthError("Session expired during attendance access")
+			if response.status != 200:
+				raise InfoMentorAPIError(
+					f"Failed to initialise attendance: HTTP {response.status}"
+				)
+			app_data = await response.json(content_type=None)
+
+		paged_list = app_data.get("pagedList", {})
+		configured_url = paged_list.get("listUrl")
+		if isinstance(configured_url, str) and configured_url.startswith("/"):
+			list_url = f"{HUB_BASE_URL}{configured_url}"
+		page_size = int(paged_list.get("pageSize") or 20)
+		payload = {"page": 1, "pageSize": page_size}
+
+		async with self._session.post(list_url, headers=headers, json=payload) as response:
+			if response.status in (401, 403):
+				raise InfoMentorAuthError("Session expired during attendance access")
+			if response.status != 200:
+				raise InfoMentorAPIError(
+					f"Failed to get attendance: HTTP {response.status}"
+				)
+			data = await response.json(content_type=None)
+
+		items = data.get("items", []) if isinstance(data, dict) else []
+		if not isinstance(items, list):
+			raise InfoMentorDataError("Unexpected attendance response format")
+		return [item for item in items if isinstance(item, dict)]
+
 	async def get_news(self, pupil_id: Optional[str] = None) -> List[NewsItem]:
 		"""Get news items for a pupil.
 		
@@ -1585,4 +1633,4 @@ class InfoMentorClient:
 				
 		# If all formats fail, return None and log warning
 		_LOGGER.warning(f"Failed to parse time: {time_str}")
-		return None 
+		return None

@@ -33,6 +33,7 @@ from .const import (
 	SENSOR_LATEST_TIMELINE_SUMMARY,
 	SENSOR_NEXT_CLASS,
 	SENSOR_TODAY_SCHEDULE_SUMMARY,
+	SENSOR_ATTENDANCE,
 	ATTR_PUPIL_ID,
 	ATTR_PUPIL_NAME,
 	ATTR_AUTHOR,
@@ -50,7 +51,7 @@ from .const import (
 	ATTR_LATEST_END,
 )
 from .coordinator import InfoMentorDataUpdateCoordinator
-from .summary import class_summary, content_summary, find_next_class, today_summary
+from .summary import attendance_summary, class_summary, content_summary, find_next_class, today_summary
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ async def async_setup_entry(
 					InfoMentorLatestTimelineSummarySensor(coordinator, config_entry, pupil_id),
 					InfoMentorNextClassSensor(coordinator, config_entry, pupil_id),
 					InfoMentorTodayScheduleSummarySensor(coordinator, config_entry, pupil_id),
+					InfoMentorAttendanceSensor(coordinator, config_entry, pupil_id),
 				])
 			except Exception as e:
 				_LOGGER.error(f"Failed to create sensors for pupil {pupil_id}: {e}")
@@ -444,6 +446,48 @@ class InfoMentorTodayScheduleSummarySensor(InfoMentorPupilSensorBase):
 				],
 			})
 		return attributes
+
+
+class InfoMentorAttendanceSensor(InfoMentorPupilSensorBase):
+	"""Historical attendance summary for a pupil."""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self._attr_name = f"{self.pupil_name} Attendance"
+		self._attr_unique_id = f"{config_entry.entry_id}_{SENSOR_ATTENDANCE}_{pupil_id}"
+		self._attr_icon = "mdi:account-check"
+
+	def _entries(self) -> List[Dict[str, Any]]:
+		if not self.coordinator.data or self.pupil_id not in self.coordinator.data:
+			return []
+		return self.coordinator.data[self.pupil_id].get("attendance", [])
+
+	@property
+	def native_value(self) -> str:
+		return attendance_summary(self._entries())
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		entries = self._entries()
+		return {
+			ATTR_PUPIL_ID: self.pupil_id,
+			ATTR_PUPIL_NAME: self.pupil_name,
+			"record_count": len(entries),
+			"records": [
+				{
+					"date": entry.get("longDate") or entry.get("shortDate"),
+					"time": entry.get("time"),
+					"subject": entry.get("subject"),
+					"reason": entry.get("reason"),
+					"registered_by": entry.get("registeredByName"),
+					"establishment": entry.get("establishmentName"),
+					"minutes": entry.get("minutes"),
+					"half_days": entry.get("halfDaysCount"),
+					"comment": entry.get("comment"),
+				}
+				for entry in entries[:20]
+			],
+		}
 
 
 class InfoMentorTimelineSensor(InfoMentorPupilSensorBase):

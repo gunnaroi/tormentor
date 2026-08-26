@@ -451,6 +451,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			"pupil_info": self.pupils_info.get(pupil_id),
 			"news": [],
 			"timeline": [],
+			"attendance": [],
 			"schedule": [],
 			"today_schedule": None,
 			"schedule_status": SCHEDULE_STATUS_MISSING,
@@ -479,6 +480,19 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			
 		except Exception as err:
 			_LOGGER.warning(f"Failed to get timeline for pupil {pupil_id}: {err}")
+
+		# Attendance is optional: failures here must never affect schedule
+		# completeness, freshness timestamps, or the primary success count.
+		try:
+			attendance = await self.client.get_attendance(pupil_id)
+			pupil_data["attendance"] = attendance
+			_LOGGER.debug(
+				"Retrieved %d attendance records for pupil %s",
+				len(attendance),
+				pupil_id,
+			)
+		except Exception as err:
+			_LOGGER.debug("Failed to get optional attendance for pupil %s: %s", pupil_id, err)
 			
 		try:
 			# Get schedule (timetable and time registration)
@@ -587,6 +601,9 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 				"pupil_info": None,
 				"news": [],
 				"timeline": [],
+				"attendance": [
+					item for item in pupil_data.get("attendance", []) if isinstance(item, dict)
+				],
 				"schedule": [],
 				"today_schedule": None,
 			}

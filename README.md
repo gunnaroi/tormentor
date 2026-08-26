@@ -35,6 +35,11 @@ For each pupil, the integration creates several sensors:
 - **Latest Timeline or Homework**: Latest timeline entry title and content
 - **Next Class**: Date, time, and subject of the next class
 - **Today Schedule Summary**: A concise summary of today's complete class schedule
+- **Attendance**: Latest historical attendance record, with up to 20 detailed records in attributes
+
+Attendance is fetched from the Icelandic past-attendance view. It is optional and
+does not affect schedule completeness, data freshness, or retry behavior if the
+attendance service is unavailable.
 
 Expose only the desired summary entities under **Settings → Voice assistants → Expose**
 to make them available through Home Assistant MCP.
