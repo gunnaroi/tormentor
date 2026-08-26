@@ -2,7 +2,7 @@
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=gunnaroi&repository=tormentor&category=integration)
 
-This custom component integrates the Icelandic InfoMentor school communication platform with Home Assistant, providing access to school schedules, news, and timeline entries for your children. It signs in through `im1.infomentor.is` and uses the modern services at `im.infomentor.is`.
+This custom component integrates the Icelandic InfoMentor school communication platform with Home Assistant, providing access to school schedules, news, and timeline entries for your children. It starts at `im.infomentor.is`, signs in through `im1.infomentor.is`, and uses the family hub and services at `minn.infomentor.is`.
 
 ## Features
 

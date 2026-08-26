@@ -15,11 +15,11 @@ from .form_utils import ParsedForm, build_login_form_data, extract_hidden_fields
 
 _LOGGER = logging.getLogger(__name__)
 
-# The Icelandic installation does not have a separate ``hub`` host. The
-# controllers used by the SPA live on im.infomentor.is, while the IM1 login
-# and legacy pages live on im1.infomentor.is.
-HUB_BASE_URL = "https://im.infomentor.is"
-MODERN_BASE_URL = HUB_BASE_URL
+# The Icelandic installation uses minn.infomentor.is for the authenticated
+# family hub and its controllers. Login starts at im.infomentor.is and the
+# legacy credential form lives on im1.infomentor.is.
+HUB_BASE_URL = "https://minn.infomentor.is"
+MODERN_BASE_URL = "https://im.infomentor.is"
 LEGACY_BASE_URL = "https://im1.infomentor.is/production/mentor/"
 
 OAUTH_LOGIN_URL = f"{HUB_BASE_URL}/Authentication/Authentication/Login?apiType=IM1&forceOAuth=true"
@@ -628,7 +628,10 @@ class InfoMentorAuth:
 			_LOGGER.info("Step 2: Getting pupil IDs from the Icelandic dashboard")
 			self.pupil_ids = []
 			if self._last_login_html:
-				self.pupil_ids = await self._extract_pupil_ids_legacy(self._last_login_html)
+				if self._has_hub_payload(self._last_login_html):
+					self.pupil_ids = self._extract_pupil_ids_from_json(self._last_login_html)
+				else:
+					self.pupil_ids = await self._extract_pupil_ids_legacy(self._last_login_html)
 			if not self.pupil_ids:
 				self.pupil_ids = await self._get_pupil_ids_modern()
 			
@@ -1021,7 +1024,7 @@ class InfoMentorAuth:
 		else:
 			success_indicators = [
 				"default.aspx" in final_url.lower(),
-				"im.infomentor.is" in final_url.lower(),
+				"minn.infomentor.is" in final_url.lower(),
 				"logout" in cred_text.lower(),
 				"dashboard" in cred_text.lower(),
 			]
@@ -1437,6 +1440,21 @@ class InfoMentorAuth:
 			_LOGGER.debug(f"*** LOGIN RESULT v0.0.51 *** {status} -> {final_url}")
 			_LOGGER.debug(f"*** LOGIN RESULT LENGTH v0.0.51 *** {len(login_result)} chars")
 
+			# Iceland returns an openid_message form after accepting credentials.
+			# Browsers submit it automatically to complete the handoff to Minn Mentor.
+			if _has_openid_form(login_result):
+				_LOGGER.info("Completing Icelandic login handoff to Minn Mentor")
+				result = await _auto_submit_openid_form(
+					self.session,
+					login_result,
+					referer=final_url,
+				)
+				if not result.executed or not result.final_text:
+					raise InfoMentorAuthError("Could not complete Icelandic login handoff")
+				login_result = result.final_text
+				final_url = result.final_url or final_url
+				_LOGGER.info("Icelandic login handoff completed at %s", final_url)
+
 			await _write_text_file_async("/tmp/infomentor_login_result.html", login_result)
 			_LOGGER.debug("*** SAVED LOGIN RESULT v0.0.51 *** /tmp/infomentor_login_result.html")
 			self._last_login_html = login_result
@@ -1521,13 +1539,13 @@ class InfoMentorAuth:
 	async def _establish_cross_domain_sessions(self) -> None:
 		"""Visit key InfoMentor domains after auth to propagate session cookies.
 
-		The login flow establishes cookies on im1.infomentor.is, but API calls
-		to im.infomentor.is need their own
-		cookies.  Visiting each domain with allow_redirects lets the server
-		issue the necessary set-cookie headers, mirroring what a browser does
+		The login flow crosses the IM1, modern, and Minn Mentor hosts. Visiting
+		each domain with redirects enabled lets the servers issue the cookies
+		needed by their respective endpoints, mirroring what a browser does
 		when the SPA loads resources from multiple subdomains.
 		"""
 		domains_to_visit = [
+			(f"{HUB_BASE_URL}/", "Minn Mentor hub"),
 			(f"{MODERN_BASE_URL}/", "modern infomentor.is"),
 			(f"{LEGACY_BASE_URL}", "legacy infomentor.is"),
 		]

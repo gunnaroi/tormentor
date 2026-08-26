@@ -185,7 +185,7 @@ class InfoMentorNotification:
 	@property
 	def full_url(self) -> str:
 		"""Build a complete URL for the notification."""
-		base = "https://im.infomentor.is"
+		base = "https://minn.infomentor.is"
 		raw = self.url
 		if raw.startswith("http"):
 			return raw
