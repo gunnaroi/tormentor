@@ -29,6 +29,10 @@ from .const import (
 	SENSOR_DATA_FRESHNESS,
 	SENSOR_NOTIFICATIONS,
 	SENSOR_DIAGNOSTIC_LOG,
+	SENSOR_LATEST_NEWS_SUMMARY,
+	SENSOR_LATEST_TIMELINE_SUMMARY,
+	SENSOR_NEXT_CLASS,
+	SENSOR_TODAY_SCHEDULE_SUMMARY,
 	ATTR_PUPIL_ID,
 	ATTR_PUPIL_NAME,
 	ATTR_AUTHOR,
@@ -46,6 +50,7 @@ from .const import (
 	ATTR_LATEST_END,
 )
 from .coordinator import InfoMentorDataUpdateCoordinator
+from .summary import class_summary, content_summary, find_next_class, today_summary
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -91,6 +96,10 @@ async def async_setup_entry(
 					InfoMentorHasSchoolTomorrowSensor(coordinator, config_entry, pupil_id),
 					InfoMentorHasPreschoolTodaySensor(coordinator, config_entry, pupil_id),
 					InfoMentorChildTypeSensor(coordinator, config_entry, pupil_id),
+					InfoMentorLatestNewsSummarySensor(coordinator, config_entry, pupil_id),
+					InfoMentorLatestTimelineSummarySensor(coordinator, config_entry, pupil_id),
+					InfoMentorNextClassSensor(coordinator, config_entry, pupil_id),
+					InfoMentorTodayScheduleSummarySensor(coordinator, config_entry, pupil_id),
 				])
 			except Exception as e:
 				_LOGGER.error(f"Failed to create sensors for pupil {pupil_id}: {e}")
@@ -306,6 +315,134 @@ class InfoMentorNewsSensor(InfoMentorPupilSensorBase):
 				})
 			attributes["news_items"] = news_list
 			
+		return attributes
+
+
+class InfoMentorLatestNewsSummarySensor(InfoMentorPupilSensorBase):
+	"""Latest news title and content in an MCP-friendly state."""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self._attr_name = f"{self.pupil_name} Latest News"
+		self._attr_unique_id = f"{config_entry.entry_id}_{SENSOR_LATEST_NEWS_SUMMARY}_{pupil_id}"
+		self._attr_icon = "mdi:newspaper-variant"
+
+	@property
+	def native_value(self) -> str:
+		return content_summary(
+			self.coordinator.get_latest_news_item(self.pupil_id), "No news"
+		)
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		entry = self.coordinator.get_latest_news_item(self.pupil_id)
+		attributes = {ATTR_PUPIL_ID: self.pupil_id, ATTR_PUPIL_NAME: self.pupil_name}
+		if entry:
+			attributes.update({
+				"title": entry.title,
+				"content": entry.content,
+				"author": entry.author,
+				"published_date": entry.published_date.isoformat(),
+			})
+		return attributes
+
+
+class InfoMentorLatestTimelineSummarySensor(InfoMentorPupilSensorBase):
+	"""Latest timeline/homework title and content in an MCP-friendly state."""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self._attr_name = f"{self.pupil_name} Latest Timeline or Homework"
+		self._attr_unique_id = f"{config_entry.entry_id}_{SENSOR_LATEST_TIMELINE_SUMMARY}_{pupil_id}"
+		self._attr_icon = "mdi:book-open-page-variant"
+
+	@property
+	def native_value(self) -> str:
+		return content_summary(
+			self.coordinator.get_latest_timeline_entry(self.pupil_id),
+			"No timeline or homework entry",
+		)
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		entry = self.coordinator.get_latest_timeline_entry(self.pupil_id)
+		attributes = {ATTR_PUPIL_ID: self.pupil_id, ATTR_PUPIL_NAME: self.pupil_name}
+		if entry:
+			attributes.update({
+				"title": entry.title,
+				"content": entry.content,
+				"entry_type": entry.entry_type,
+				"author": entry.author,
+				"date": entry.date.isoformat(),
+			})
+		return attributes
+
+
+class InfoMentorNextClassSensor(InfoMentorPupilSensorBase):
+	"""Next class in an MCP-friendly state."""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self._attr_name = f"{self.pupil_name} Next Class"
+		self._attr_unique_id = f"{config_entry.entry_id}_{SENSOR_NEXT_CLASS}_{pupil_id}"
+		self._attr_icon = "mdi:calendar-arrow-right"
+
+	def _entry(self) -> Any | None:
+		return find_next_class(
+			self.coordinator.get_pupil_schedule(self.pupil_id), datetime.now()
+		)
+
+	@property
+	def native_value(self) -> str:
+		return class_summary(self._entry())
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		entry = self._entry()
+		attributes = {ATTR_PUPIL_ID: self.pupil_id, ATTR_PUPIL_NAME: self.pupil_name}
+		if entry:
+			attributes.update({
+				"subject": entry.subject or entry.title,
+				"date": entry.date.strftime("%Y-%m-%d"),
+				"start_time": entry.start_time.strftime("%H:%M") if entry.start_time else None,
+				"end_time": entry.end_time.strftime("%H:%M") if entry.end_time else None,
+				"teacher": entry.teacher,
+				"classroom": entry.room,
+			})
+		return attributes
+
+
+class InfoMentorTodayScheduleSummarySensor(InfoMentorPupilSensorBase):
+	"""Today's complete schedule in an MCP-friendly state."""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self._attr_name = f"{self.pupil_name} Today Schedule Summary"
+		self._attr_unique_id = f"{config_entry.entry_id}_{SENSOR_TODAY_SCHEDULE_SUMMARY}_{pupil_id}"
+		self._attr_icon = "mdi:calendar-text"
+
+	@property
+	def native_value(self) -> str:
+		return today_summary(self.coordinator.get_today_schedule(self.pupil_id))
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		day = self.coordinator.get_today_schedule(self.pupil_id)
+		attributes = {ATTR_PUPIL_ID: self.pupil_id, ATTR_PUPIL_NAME: self.pupil_name}
+		if day:
+			attributes.update({
+				"date": day.date.strftime("%Y-%m-%d"),
+				"classes": [
+					{
+						"subject": entry.subject or entry.title,
+						"start_time": entry.start_time.strftime("%H:%M") if entry.start_time else None,
+						"end_time": entry.end_time.strftime("%H:%M") if entry.end_time else None,
+						"teacher": entry.teacher,
+						"classroom": entry.room,
+					}
+					for entry in day.timetable_entries
+				],
+			})
 		return attributes
 
 

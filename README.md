@@ -31,6 +31,13 @@ For each pupil, the integration creates several sensors:
 #### Communication Sensors
 - **News**: Count and details of unread school news
 - **Timeline**: Count and details of timeline entries
+- **Latest News**: Latest news title and content in a dashboard/Assist/MCP-friendly state
+- **Latest Timeline or Homework**: Latest timeline entry title and content
+- **Next Class**: Date, time, and subject of the next class
+- **Today Schedule Summary**: A concise summary of today's complete class schedule
+
+Expose only the desired summary entities under **Settings → Voice assistants → Expose**
+to make them available through Home Assistant MCP.
 
 #### Notification Sensors
 - **Notifications**: Unread notification count; attributes include the latest 20 notifications with title, date, type, pupil, URL, and state
