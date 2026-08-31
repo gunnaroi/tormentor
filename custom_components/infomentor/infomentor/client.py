@@ -34,6 +34,8 @@ class InfoMentorClient:
 		self.storage = storage
 		self.auth: Optional[InfoMentorAuth] = None
 		self.authenticated = False
+		# Structural diagnostics only: keys and collection sizes, never message text.
+		self.timeline_response_shapes: Dict[str, Dict[str, Any]] = {}
 		
 	async def __aenter__(self):
 		"""Async context manager entry."""
@@ -476,6 +478,7 @@ class InfoMentorClient:
 						_LOGGER.error(f"Timeline response doesn't look like JSON: {text[:200]}...")
 						raise InfoMentorAuthError("Authentication may have failed - non-JSON response")
 				
+				self.timeline_response_shapes[str(pupil_id or "current")] = self._describe_json_shape(data)
 				return self._parse_timeline_data(data, pupil_id)
 				
 		except aiohttp.ClientError as e:
@@ -1280,19 +1283,18 @@ class InfoMentorClient:
 		timeline_entries = []
 		
 		try:
-			# The exact structure will depend on the actual API response
-			entries = data.get("entries", data.get("items", [])) if isinstance(data, dict) else []
+			entries = self._find_timeline_entries(data)
 			
 			for entry in entries:
 				try:
 					timeline_entry = TimelineEntry(
-						id=str(entry.get("id", "")),
-						title=entry.get("title", ""),
-						content=entry.get("content", entry.get("description", "")),
-						date=self._parse_date(entry.get("date", entry.get("timestamp"))),
-						entry_type=entry.get("type", "unknown"),
+						id=str(entry.get("id", entry.get("Id", ""))),
+						title=entry.get("title", entry.get("Title", entry.get("name", entry.get("Name", "")))),
+						content=entry.get("content", entry.get("Content", entry.get("description", entry.get("Description", "")))),
+						date=self._parse_date(entry.get("date", entry.get("Date", entry.get("timestamp", entry.get("Timestamp"))))),
+						entry_type=entry.get("type", entry.get("Type", "unknown")),
 						pupil_id=pupil_id,
-						author=entry.get("author")
+						author=entry.get("author", entry.get("Author"))
 					)
 					timeline_entries.append(timeline_entry)
 				except (KeyError, ValueError) as e:
@@ -1304,6 +1306,50 @@ class InfoMentorClient:
 			raise InfoMentorDataError(f"Failed to parse timeline data: {e}") from e
 			
 		return timeline_entries
+
+	@classmethod
+	def _find_timeline_entries(cls, data: Any) -> List[Dict[str, Any]]:
+		"""Find the timeline collection across API response casing/wrappers."""
+		if isinstance(data, list):
+			if not data or all(isinstance(item, dict) for item in data):
+				return data
+			return []
+		if not isinstance(data, dict):
+			return []
+
+		preferred = {"entries", "items", "timelineentries", "grouptimelineentries", "results"}
+		for key, value in data.items():
+			if key.lower() in preferred and isinstance(value, list):
+				return [item for item in value if isinstance(item, dict)]
+		for key in ("data", "result", "response", "model"):
+			for actual_key, value in data.items():
+				if actual_key.lower() == key:
+					found = cls._find_timeline_entries(value)
+					if found:
+						return found
+		return []
+
+	@classmethod
+	def _describe_json_shape(cls, data: Any, depth: int = 0) -> Dict[str, Any]:
+		"""Return privacy-safe response structure for HA diagnostics."""
+		if depth >= 3:
+			return {"type": type(data).__name__}
+		if isinstance(data, list):
+			result: Dict[str, Any] = {"type": "list", "count": len(data)}
+			if data:
+				result["item"] = cls._describe_json_shape(data[0], depth + 1)
+			return result
+		if isinstance(data, dict):
+			return {
+				"type": "object",
+				"keys": sorted(str(key) for key in data.keys()),
+				"children": {
+					str(key): cls._describe_json_shape(value, depth + 1)
+					for key, value in data.items()
+					if isinstance(value, (dict, list))
+				},
+			}
+		return {"type": type(data).__name__}
 
 	def _parse_timetable_from_api(self, data: Any, pupil_id: Optional[str], start_date: datetime, end_date: datetime) -> List[TimetableEntry]:
 		"""Parse timetable data from API response.

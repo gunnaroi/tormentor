@@ -69,6 +69,9 @@ async def async_get_config_entry_diagnostics(
 			"cookies_by_domain": cookies_by_domain,
 			"cookies_total": sum(cookies_by_domain.values()),
 			"diagnostic_events": coordinator.diagnostic_events,
+			"timeline_response_shapes": (
+				coordinator.client.timeline_response_shapes if coordinator.client else {}
+			),
 		}
 
 		recent_notifications = []
