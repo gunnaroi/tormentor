@@ -247,13 +247,32 @@ class InfoMentorClient:
 		shape (e.g. the sortBy value) isn't confirmed live the way news now is.
 		"""
 		url = f"{HUB_BASE_URL}{path}"
+		# DEFAULT_HEADERS is built for a top-level page navigation (Sec-Fetch-Dest:
+		# document/Sec-Fetch-Mode: navigate/Sec-Fetch-Site: none, Sec-Fetch-User,
+		# Upgrade-Insecure-Requests) — confirmed via a real captured request that an
+		# XHR call to a JSON Hub App endpoint instead sends Sec-Fetch-Dest: empty,
+		# Sec-Fetch-Mode: cors, Sec-Fetch-Site: same-origin, and none of the
+		# navigation-only headers. Overriding/removing them here rather than in every
+		# caller, since every _get_hub_json call is this same XHR shape, never a
+		# navigation.
 		headers = DEFAULT_HEADERS.copy()
+		for key in ("Cache-Control", "Pragma", "Sec-Fetch-User", "Upgrade-Insecure-Requests"):
+			headers.pop(key, None)
 		headers.update({
 			"Accept": "application/json, text/javascript, */*; q=0.01",
 			"X-Requested-With": "XMLHttpRequest",
+			"Sec-Fetch-Dest": "empty",
+			"Sec-Fetch-Mode": "cors",
+			"Sec-Fetch-Site": "same-origin",
+			"Origin": HUB_BASE_URL,
 		})
-		if referer:
-			headers["Referer"] = f"{HUB_BASE_URL}{referer}"
+		# Real browsers never send a URL fragment (the #/... hash route) in Referer —
+		# fragments are client-side only. A hash-router SPA's XHR calls always carry
+		# the plain document Referer regardless of which hash route triggered them,
+		# confirmed by the real captured request (Referer: https://minn.infomentor.is/,
+		# not .../#/communication/news). `referer` is accepted for callers to record
+		# intent/context in their own code but intentionally unused here.
+		headers["Referer"] = f"{HUB_BASE_URL}/"
 
 		request_fn = self._session.post if method == "POST" else self._session.get
 		request_kwargs = {"headers": headers}
