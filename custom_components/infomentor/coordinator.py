@@ -14,7 +14,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .infomentor.client import InfoMentorClient
 from .infomentor.exceptions import InfoMentorAuthError, InfoMentorConnectionError
-from .infomentor.models import NewsItem, TimelineEntry, PupilInfo, ScheduleDay, TimetableEntry, TimeRegistrationEntry, InfoMentorNotification
+from .infomentor.models import NewsItem, TimelineEntry, PupilInfo, ScheduleDay, TimetableEntry, TimeRegistrationEntry, InfoMentorNotification, Message, CalendarEntry, MeetingAvailability
 from .storage import InfoMentorStorage
 from .schedule_guard import (
 	SCHEDULE_STATUS_CACHED,
@@ -455,22 +455,51 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			"schedule": [],
 			"today_schedule": None,
 			"schedule_status": SCHEDULE_STATUS_MISSING,
+			"messages": [],
+			"calendar_entries": [],
+			"meeting_availabilities": [],
 		}
-		
+
 		# Track which data sources succeeded
 		success_count = 0
 		total_sources = 3  # news, timeline, schedule
-		
+
 		try:
 			# Get news
 			news_items = await self.client.get_news(pupil_id)
 			pupil_data["news"] = news_items
 			success_count += 1
 			_LOGGER.debug(f"Retrieved {len(news_items)} news items for pupil {pupil_id}")
-			
+
 		except Exception as err:
 			_LOGGER.warning(f"Failed to get news for pupil {pupil_id}: {err}")
-			
+
+		try:
+			# Get direct messages (Skilaboð) — not counted in total_sources/success_count
+			# since it's new and best-effort; a failure here shouldn't read as "pupil
+			# update mostly failed" the way a news/timeline/schedule failure would.
+			messages = await self.client.get_messages(pupil_id)
+			pupil_data["messages"] = messages
+			_LOGGER.debug(f"Retrieved {len(messages)} messages for pupil {pupil_id}")
+		except Exception as err:
+			_LOGGER.debug(f"Failed to get messages for pupil {pupil_id}: {err}")
+
+		try:
+			# Get general calendar entries (Dagatal)
+			calendar_entries = await self.client.get_calendar_entries(pupil_id)
+			pupil_data["calendar_entries"] = calendar_entries
+			_LOGGER.debug(f"Retrieved {len(calendar_entries)} calendar entries for pupil {pupil_id}")
+		except Exception as err:
+			_LOGGER.debug(f"Failed to get calendar entries for pupil {pupil_id}: {err}")
+
+		try:
+			# Get open parent-teacher meeting slots (Fundarbókun)
+			availabilities = await self.client.get_meeting_availabilities(pupil_id)
+			pupil_data["meeting_availabilities"] = availabilities
+			_LOGGER.debug(f"Retrieved {len(availabilities)} meeting availabilities for pupil {pupil_id}")
+		except Exception as err:
+			_LOGGER.debug(f"Failed to get meeting availabilities for pupil {pupil_id}: {err}")
+
 		try:
 			# Get timeline
 			timeline_entries = await self.client.get_timeline(pupil_id)
@@ -968,7 +997,53 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 				# Assume timeline entries are sorted by date descending
 				return timeline_entries[0]
 		return None
-		
+
+	def get_messages(self, pupil_id: str) -> List[Message]:
+		"""Get direct message threads (Skilaboð) for a pupil."""
+		if self.data and pupil_id in self.data:
+			return self.data[pupil_id].get("messages", [])
+		return []
+
+	def get_latest_message(self, pupil_id: str) -> Optional[Message]:
+		"""Get the most recent direct message thread for a pupil."""
+		messages = self.get_messages(pupil_id)
+		if not messages:
+			return None
+		# Unlike news, message order isn't confirmed from the API yet — sort explicitly.
+		return sorted(messages, key=lambda m: m.date, reverse=True)[0]
+
+	def get_calendar_entries(self, pupil_id: str) -> List[CalendarEntry]:
+		"""Get general calendar entries (Dagatal) for a pupil."""
+		if self.data and pupil_id in self.data:
+			return self.data[pupil_id].get("calendar_entries", [])
+		return []
+
+	def get_next_calendar_entry(self, pupil_id: str) -> Optional[CalendarEntry]:
+		"""Get the soonest upcoming calendar entry for a pupil, or the soonest past
+		one if nothing is upcoming (mirrors how the timetable sensors fall back)."""
+		entries = self.get_calendar_entries(pupil_id)
+		if not entries:
+			return None
+		now = datetime.now()
+		upcoming = sorted((e for e in entries if e.start >= now), key=lambda e: e.start)
+		if upcoming:
+			return upcoming[0]
+		return sorted(entries, key=lambda e: e.start, reverse=True)[0]
+
+	def get_meeting_availabilities(self, pupil_id: str) -> List[MeetingAvailability]:
+		"""Get open parent-teacher meeting slots (Fundarbókun) for a pupil."""
+		if self.data and pupil_id in self.data:
+			return self.data[pupil_id].get("meeting_availabilities", [])
+		return []
+
+	def get_next_meeting_availability(self, pupil_id: str) -> Optional[MeetingAvailability]:
+		"""Get the soonest open (unbooked) parent-teacher meeting slot for a pupil."""
+		slots = [s for s in self.get_meeting_availabilities(pupil_id) if not s.booked]
+		if not slots:
+			return None
+		return sorted(slots, key=lambda s: s.start)[0]
+
+
 	def get_pupil_schedule(self, pupil_id: str) -> List[ScheduleDay]:
 		"""Get schedule for a pupil."""
 		if self.data and pupil_id in self.data:

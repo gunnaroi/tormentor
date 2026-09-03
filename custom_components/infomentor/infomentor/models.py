@@ -24,9 +24,54 @@ class NewsItem:
 	author: Optional[str] = None
 	category: Optional[str] = None
 	pupil_id: Optional[str] = None
-	
+
 	def __str__(self) -> str:
 		return f"{self.title} - {self.published_date.strftime('%Y-%m-%d')}"
+
+
+@dataclass
+class Message:
+	"""A direct message thread between a parent and school staff (Skilaboð)."""
+	id: str
+	subject: str
+	body: str
+	date: datetime
+	sender: Optional[str] = None
+	unread: bool = False
+	pupil_id: Optional[str] = None
+
+	def __str__(self) -> str:
+		return f"{self.subject} - {self.date.strftime('%Y-%m-%d')}"
+
+
+@dataclass
+class CalendarEntry:
+	"""A general calendar entry (Dagatal) — distinct from the weekly class timetable."""
+	id: str
+	title: str
+	start: datetime
+	end: Optional[datetime] = None
+	all_day: bool = False
+	description: Optional[str] = None
+	location: Optional[str] = None
+	pupil_id: Optional[str] = None
+
+	def __str__(self) -> str:
+		return f"{self.title} - {self.start.strftime('%Y-%m-%d %H:%M')}"
+
+
+@dataclass
+class MeetingAvailability:
+	"""An available parent-teacher meeting slot (Fundarbókun) waiting to be booked."""
+	id: str
+	start: datetime
+	end: Optional[datetime] = None
+	teacher: Optional[str] = None
+	booked: bool = False
+	pupil_id: Optional[str] = None
+
+	def __str__(self) -> str:
+		return f"{self.teacher or 'meeting'} - {self.start.strftime('%Y-%m-%d %H:%M')}"
 
 
 @dataclass

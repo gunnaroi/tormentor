@@ -46,6 +46,9 @@ SENSOR_LATEST_TIMELINE_SUMMARY = "latest_timeline_summary"
 SENSOR_NEXT_CLASS = "next_class"
 SENSOR_TODAY_SCHEDULE_SUMMARY = "today_schedule_summary"
 SENSOR_ATTENDANCE = "attendance"
+SENSOR_LATEST_MESSAGE_SUMMARY = "latest_message_summary"
+SENSOR_NEXT_CALENDAR_ENTRY_SUMMARY = "next_calendar_entry_summary"
+SENSOR_MEETING_AVAILABILITY_SUMMARY = "meeting_availability_summary"
 
 # Button entities
 BUTTON_DIAGNOSTICS_REFRESH = "diagnostics_refresh"

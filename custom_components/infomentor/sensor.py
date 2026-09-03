@@ -34,6 +34,9 @@ from .const import (
 	SENSOR_NEXT_CLASS,
 	SENSOR_TODAY_SCHEDULE_SUMMARY,
 	SENSOR_ATTENDANCE,
+	SENSOR_LATEST_MESSAGE_SUMMARY,
+	SENSOR_NEXT_CALENDAR_ENTRY_SUMMARY,
+	SENSOR_MEETING_AVAILABILITY_SUMMARY,
 	ATTR_PUPIL_ID,
 	ATTR_PUPIL_NAME,
 	ATTR_AUTHOR,
@@ -51,7 +54,7 @@ from .const import (
 	ATTR_LATEST_END,
 )
 from .coordinator import InfoMentorDataUpdateCoordinator
-from .summary import attendance_summary, class_summary, content_summary, find_next_class, today_summary
+from .summary import attendance_summary, class_summary, content_summary, find_next_class, meeting_availability_summary, today_summary
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -102,6 +105,9 @@ async def async_setup_entry(
 					InfoMentorNextClassSensor(coordinator, config_entry, pupil_id),
 					InfoMentorTodayScheduleSummarySensor(coordinator, config_entry, pupil_id),
 					InfoMentorAttendanceSensor(coordinator, config_entry, pupil_id),
+					InfoMentorLatestMessageSummarySensor(coordinator, config_entry, pupil_id),
+					InfoMentorNextCalendarEntrySensor(coordinator, config_entry, pupil_id),
+					InfoMentorMeetingAvailabilitySensor(coordinator, config_entry, pupil_id),
 				])
 			except Exception as e:
 				_LOGGER.error(f"Failed to create sensors for pupil {pupil_id}: {e}")
@@ -376,6 +382,110 @@ class InfoMentorLatestTimelineSummarySensor(InfoMentorPupilSensorBase):
 				"entry_type": entry.entry_type,
 				"author": entry.author,
 				"date": entry.date.isoformat(),
+			})
+		return attributes
+
+
+class InfoMentorLatestMessageSummarySensor(InfoMentorPupilSensorBase):
+	"""Latest direct message (Skilaboð) in an MCP-friendly state.
+
+	Skilaboð is InfoMentor's direct parent/staff messaging — distinct from News
+	and from the NotificationApp activity feed, and previously not exposed by
+	this integration at all.
+	"""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self._attr_name = f"{self.pupil_name} Latest Message"
+		self._attr_unique_id = f"{config_entry.entry_id}_{SENSOR_LATEST_MESSAGE_SUMMARY}_{pupil_id}"
+		self._attr_icon = "mdi:email-outline"
+
+	@property
+	def native_value(self) -> str:
+		return content_summary(self.coordinator.get_latest_message(self.pupil_id), "No messages")
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		entry = self.coordinator.get_latest_message(self.pupil_id)
+		attributes = {ATTR_PUPIL_ID: self.pupil_id, ATTR_PUPIL_NAME: self.pupil_name}
+		if entry:
+			attributes.update({
+				"subject": entry.subject,
+				"body": entry.body,
+				"sender": entry.sender,
+				"unread": entry.unread,
+				"date": entry.date.isoformat(),
+			})
+		return attributes
+
+
+class InfoMentorNextCalendarEntrySensor(InfoMentorPupilSensorBase):
+	"""Next general calendar entry (Dagatal) in an MCP-friendly state.
+
+	Dagatal is the general school/class calendar — distinct from the weekly
+	class timetable and from TimeRegistration's fritids calendar, and
+	previously not exposed by this integration at all.
+	"""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self._attr_name = f"{self.pupil_name} Next Calendar Entry"
+		self._attr_unique_id = f"{config_entry.entry_id}_{SENSOR_NEXT_CALENDAR_ENTRY_SUMMARY}_{pupil_id}"
+		self._attr_icon = "mdi:calendar-star"
+
+	@property
+	def native_value(self) -> str:
+		return content_summary(self.coordinator.get_next_calendar_entry(self.pupil_id), "No calendar entries")
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		entry = self.coordinator.get_next_calendar_entry(self.pupil_id)
+		attributes = {ATTR_PUPIL_ID: self.pupil_id, ATTR_PUPIL_NAME: self.pupil_name}
+		if entry:
+			attributes.update({
+				"title": entry.title,
+				"description": entry.description,
+				"location": entry.location,
+				"all_day": entry.all_day,
+				"start": entry.start.isoformat(),
+				"end": entry.end.isoformat() if entry.end else None,
+			})
+		return attributes
+
+
+class InfoMentorMeetingAvailabilitySensor(InfoMentorPupilSensorBase):
+	"""Next open parent-teacher meeting slot (Fundarbókun) in an MCP-friendly state.
+
+	Surfaces the actual bookable slot(s) behind a "Bókaðu fundartíma" (book a
+	meeting time) notification — previously the notification fired but nothing
+	exposed what's actually available to book.
+	"""
+
+	def __init__(self, coordinator, config_entry, pupil_id: str) -> None:
+		super().__init__(coordinator, config_entry, pupil_id)
+		self._attr_name = f"{self.pupil_name} Meeting Availability"
+		self._attr_unique_id = f"{config_entry.entry_id}_{SENSOR_MEETING_AVAILABILITY_SUMMARY}_{pupil_id}"
+		self._attr_icon = "mdi:calendar-clock"
+
+	@property
+	def native_value(self) -> str:
+		return meeting_availability_summary(self.coordinator.get_next_meeting_availability(self.pupil_id))
+
+	@property
+	def extra_state_attributes(self) -> Dict[str, Any]:
+		slots = self.coordinator.get_meeting_availabilities(self.pupil_id)
+		open_slots = [s for s in slots if not s.booked]
+		attributes = {
+			ATTR_PUPIL_ID: self.pupil_id,
+			ATTR_PUPIL_NAME: self.pupil_name,
+			"open_slot_count": len(open_slots),
+		}
+		entry = self.coordinator.get_next_meeting_availability(self.pupil_id)
+		if entry:
+			attributes.update({
+				"teacher": entry.teacher,
+				"start": entry.start.isoformat(),
+				"end": entry.end.isoformat() if entry.end else None,
 			})
 		return attributes
 

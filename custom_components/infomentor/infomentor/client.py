@@ -12,7 +12,7 @@ from .auth import InfoMentorAuth, HUB_BASE_URL, MODERN_BASE_URL, DEFAULT_HEADERS
 from .models import (
 	NewsItem, TimelineEntry, PupilInfo, Assignment, AttendanceEntry,
 	TimetableEntry, TimeRegistrationEntry, ScheduleDay,
-	InfoMentorNotification,
+	InfoMentorNotification, Message, CalendarEntry, MeetingAvailability,
 )
 from .exceptions import InfoMentorAPIError, InfoMentorConnectionError, InfoMentorDataError, InfoMentorAuthError
 
@@ -232,7 +232,153 @@ class InfoMentorClient:
 			raise InfoMentorConnectionError(f"Connection error: {e}") from e
 		except json.JSONDecodeError as e:
 			raise InfoMentorDataError(f"Failed to parse news data: {e}") from e
-			
+
+	async def _get_hub_json(self, path: str, *, method: str = "POST", referer: Optional[str] = None) -> Any:
+		"""POST/GET a Hub App endpoint and return parsed JSON, or raise on HTML/empty/error.
+
+		Shared by get_messages/get_calendar_entries/get_meeting_availabilities — same
+		content-type/HTML/empty-body handling get_news() uses, factored out since three
+		new endpoints need the identical checks. Field-level shape (dict wrapped in a
+		top-level key vs. a bare list) is not yet confirmed against live data for these
+		three; callers unwrap defensively.
+		"""
+		url = f"{HUB_BASE_URL}{path}"
+		headers = DEFAULT_HEADERS.copy()
+		headers.update({
+			"Accept": "application/json, text/javascript, */*; q=0.01",
+			"X-Requested-With": "XMLHttpRequest",
+		})
+		if referer:
+			headers["Referer"] = f"{HUB_BASE_URL}{referer}"
+
+		request_fn = self._session.post if method == "POST" else self._session.get
+		try:
+			async with request_fn(url, headers=headers) as resp:
+				if resp.status != 200:
+					raise InfoMentorAPIError(f"{path} returned HTTP {resp.status}")
+
+				content_type = resp.headers.get("content-type", "").lower()
+				if "text/html" in content_type:
+					_LOGGER.warning("%s returned HTML — session may have expired", path)
+					raise InfoMentorAuthError(f"Session expired fetching {path}")
+
+				text = await resp.text()
+				stripped = text.strip()
+				if not stripped:
+					_LOGGER.warning("%s returned empty body (content-type=%s)", path, content_type)
+					raise InfoMentorDataError(f"{path} returned empty body")
+
+				try:
+					return json.loads(stripped)
+				except json.JSONDecodeError as e:
+					raise InfoMentorDataError(f"Failed to parse {path} response: {e}") from e
+		except aiohttp.ClientError as e:
+			raise InfoMentorConnectionError(f"Connection error fetching {path}: {e}") from e
+
+	@staticmethod
+	def _unwrap_items(data: Any, *keys: str) -> List[dict]:
+		"""Pull a list of dicts out of a Hub App response, trying known wrapper keys
+		before falling back to a bare list — mirrors the defensive shape handling
+		added to get_notifications() once the real response shape was confirmed live."""
+		if isinstance(data, list):
+			return [item for item in data if isinstance(item, dict)]
+		if isinstance(data, dict):
+			for key in keys:
+				value = data.get(key)
+				if isinstance(value, list):
+					return [item for item in value if isinstance(item, dict)]
+		return []
+
+	async def get_messages(self, pupil_id: Optional[str] = None) -> List[Message]:
+		"""Get direct message threads (Skilaboð) — parent/staff messaging, distinct
+		from News and from NotificationApp's activity feed. Not yet covered by any
+		existing sensor; response shape is best-effort until confirmed live.
+		"""
+		self._ensure_authenticated()
+		if pupil_id:
+			await self.switch_pupil(pupil_id)
+
+		data = await self._get_hub_json("/Message/message/GetMessages", referer="/#/message")
+		items = self._unwrap_items(data, "items", "messages", "threads")
+
+		messages: List[Message] = []
+		for item in items:
+			try:
+				messages.append(Message(
+					id=str(item.get("id", item.get("threadId", ""))),
+					subject=item.get("subject", item.get("title", "")),
+					body=item.get("body", item.get("content", item.get("preview", ""))),
+					date=self._parse_date(item.get("date", item.get("createdDate", item.get("lastMessageDate")))),
+					sender=item.get("sender", item.get("from", item.get("author"))),
+					unread=bool(item.get("unread", not item.get("isRead", True))),
+					pupil_id=pupil_id,
+				))
+			except (KeyError, ValueError) as e:
+				_LOGGER.warning("Failed to parse message: %s", e)
+				continue
+		return messages
+
+	async def get_calendar_entries(self, pupil_id: Optional[str] = None) -> List[CalendarEntry]:
+		"""Get general calendar entries (Dagatal) — school-wide/class events distinct
+		from the weekly class timetable and from TimeRegistration's fritids calendar.
+		Response shape is best-effort until confirmed live.
+		"""
+		self._ensure_authenticated()
+		if pupil_id:
+			await self.switch_pupil(pupil_id)
+
+		data = await self._get_hub_json("/calendarv2/calendarv2/getentries", referer="/#/calendarv2/whole_week")
+		items = self._unwrap_items(data, "items", "entries", "events")
+
+		entries: List[CalendarEntry] = []
+		for item in items:
+			try:
+				start = self._parse_date(item.get("start", item.get("startDate", item.get("start_date"))))
+				end_raw = item.get("end", item.get("endDate", item.get("end_date")))
+				entries.append(CalendarEntry(
+					id=str(item.get("id", item.get("eventId", ""))),
+					title=item.get("title", item.get("subject", item.get("name", ""))),
+					start=start,
+					end=self._parse_date(end_raw) if end_raw else None,
+					all_day=bool(item.get("allDay", item.get("isAllDay", False))),
+					description=item.get("description", item.get("content")),
+					location=item.get("location"),
+					pupil_id=pupil_id,
+				))
+			except (KeyError, ValueError) as e:
+				_LOGGER.warning("Failed to parse calendar entry: %s", e)
+				continue
+		return entries
+
+	async def get_meeting_availabilities(self, pupil_id: Optional[str] = None) -> List[MeetingAvailability]:
+		"""Get open parent-teacher meeting slots (Fundarbókun) waiting to be booked —
+		the data behind the "Bókaðu fundartíma" notification type. Response shape is
+		best-effort until confirmed live.
+		"""
+		self._ensure_authenticated()
+		if pupil_id:
+			await self.switch_pupil(pupil_id)
+
+		data = await self._get_hub_json("/Home/meeting/GetPupilAvailabilities", referer="/#/meeting")
+		items = self._unwrap_items(data, "items", "availabilities", "slots")
+
+		slots: List[MeetingAvailability] = []
+		for item in items:
+			try:
+				end_raw = item.get("end", item.get("endTime"))
+				slots.append(MeetingAvailability(
+					id=str(item.get("id", "")),
+					start=self._parse_date(item.get("start", item.get("startTime"))),
+					end=self._parse_date(end_raw) if end_raw else None,
+					teacher=item.get("teacher", item.get("teacherName", item.get("staffName"))),
+					booked=bool(item.get("booked", item.get("isBooked", False))),
+					pupil_id=pupil_id,
+				))
+			except (KeyError, ValueError) as e:
+				_LOGGER.warning("Failed to parse meeting availability: %s", e)
+				continue
+		return slots
+
 	async def warmup_hub_session(self) -> bool:
 		"""Replay the browser SPA warm-up calls so the hub server session is primed.
 

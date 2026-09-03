@@ -22,14 +22,25 @@ def limited(value: str, empty: str = "No data") -> str:
 
 
 def content_summary(entry: Any | None, empty: str) -> str:
-	"""Return the title and content of one news/timeline entry."""
+	"""Return the title and content of one news/timeline/calendar/message entry."""
 	if entry is None:
 		return empty
-	title = compact(getattr(entry, "title", "")) or "Untitled"
+	title = compact(getattr(entry, "title", "") or getattr(entry, "subject", "")) or "Untitled"
 	content = compact(
-		getattr(entry, "content", getattr(entry, "description", ""))
+		getattr(entry, "content", "")
+		or getattr(entry, "description", "")
+		or getattr(entry, "body", "")
 	)
 	return limited(f"{title}: {content}" if content else title, empty)
+
+
+def meeting_availability_summary(entry: Any | None) -> str:
+	"""Return a readable summary of one open parent-teacher meeting slot."""
+	if entry is None:
+		return "No open meeting slots"
+	when = entry.start.strftime("%a %d %b, %H:%M")
+	teacher = compact(getattr(entry, "teacher", "")) or "Meeting"
+	return limited(f"{when} — {teacher}")
 
 
 def find_next_class(days: Iterable[Any], now: datetime) -> Any | None:
