@@ -985,8 +985,9 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		if self.data and pupil_id in self.data:
 			news_items = self.data[pupil_id].get("news", [])
 			if news_items:
-				# Assume news items are sorted by date descending
-				return news_items[0]
+				# Sort explicitly rather than trust API order — unverified assumptions
+				# about ordering are exactly what let the missing-article bug hide.
+				return sorted(news_items, key=lambda n: n.published_date, reverse=True)[0]
 		return None
 		
 	def get_latest_timeline_entry(self, pupil_id: str) -> Optional[TimelineEntry]:
@@ -994,8 +995,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		if self.data and pupil_id in self.data:
 			timeline_entries = self.data[pupil_id].get("timeline", [])
 			if timeline_entries:
-				# Assume timeline entries are sorted by date descending
-				return timeline_entries[0]
+				return sorted(timeline_entries, key=lambda t: t.date, reverse=True)[0]
 		return None
 
 	def get_messages(self, pupil_id: str) -> List[Message]:

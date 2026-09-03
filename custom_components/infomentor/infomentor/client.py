@@ -179,57 +179,48 @@ class InfoMentorClient:
 
 	async def get_news(self, pupil_id: Optional[str] = None) -> List[NewsItem]:
 		"""Get news items for a pupil.
-		
+
+		Two real bugs fixed here (confirmed against live traffic — the account's
+		newest article was silently missing from every fetch, even right after a
+		fresh session):
+		  1. This used to GET the endpoint; the real frontend always POSTs to
+		     Communication/News/GetNewsList. A GET appears to hit a different
+		     server-side path that returns a stale/incomplete list rather than
+		     erroring, so the bug was invisible — it looked like "fewer items",
+		     not "broken".
+		  2. The real frontend always primes Communication/Communication/appData
+		     (action=news&tab=news) immediately before GetNewsList, the same
+		     pattern every Hub App module uses. This never did that priming call.
+
 		Args:
 			pupil_id: Optional pupil ID. If provided, switches to that pupil first.
-			
+
 		Returns:
 			List of news items
 		"""
 		self._ensure_authenticated()
-		
+
 		if pupil_id:
 			await self.switch_pupil(pupil_id)
-			
-		url = f"{HUB_BASE_URL}/Communication/News/GetNewsList"
-		headers = DEFAULT_HEADERS.copy()
-		headers.update({
-			"Accept": "application/json, text/javascript, */*; q=0.01",
-			"X-Requested-With": "XMLHttpRequest",
-		})
-		
+
+		# Prime the server-side SPA session for this module, exactly as the real
+		# frontend does before every GetNewsList call. Best-effort — a priming
+		# failure shouldn't block the actual fetch below from being attempted.
 		try:
-			async with self._session.get(url, headers=headers) as resp:
-				if resp.status != 200:
-					raise InfoMentorAPIError(f"Failed to get news: HTTP {resp.status}")
-				
-				# Check content type before attempting JSON decode
-				content_type = resp.headers.get('content-type', '').lower()
-				if 'text/html' in content_type:
-					# If we get HTML instead of JSON, session likely expired
-					_LOGGER.warning(f"Got HTML response instead of JSON for news - session may have expired")
-					raise InfoMentorAuthError("Session expired - received HTML instead of JSON")
-				
-				try:
-					data = await resp.json()
-				except aiohttp.ContentTypeError as e:
-					# Handle cases where content-type header is wrong but content might still be JSON
-					text = await resp.text()
-					_LOGGER.warning(f"Content-type error for news, attempting manual JSON parse: {e}")
-					if text.strip().startswith('{') or text.strip().startswith('['):
-						try:
-							data = json.loads(text)
-						except json.JSONDecodeError:
-							_LOGGER.error(f"Failed to parse response as JSON: {text[:200]}...")
-							raise InfoMentorDataError("Invalid JSON response from news endpoint")
-					else:
-						_LOGGER.error(f"Response doesn't look like JSON: {text[:200]}...")
-						raise InfoMentorAuthError("Authentication may have failed - non-JSON response")
-				
-				return self._parse_news_data(data, pupil_id)
-				
-		except aiohttp.ClientError as e:
-			raise InfoMentorConnectionError(f"Connection error: {e}") from e
+			await self._get_hub_json(
+				"/communication/communication/appData?codename=communication&action=news&tab=news",
+				referer="/#/communication/news",
+			)
+		except Exception as err:
+			_LOGGER.debug("News appData priming call failed (continuing anyway): %s", err)
+
+		try:
+			data = await self._get_hub_json("/Communication/News/GetNewsList", referer="/#/communication/news")
+			return self._parse_news_data(data, pupil_id)
+		except InfoMentorDataError:
+			raise
+		except (InfoMentorAPIError, InfoMentorAuthError, InfoMentorConnectionError):
+			raise
 		except json.JSONDecodeError as e:
 			raise InfoMentorDataError(f"Failed to parse news data: {e}") from e
 
