@@ -180,17 +180,20 @@ class InfoMentorClient:
 	async def get_news(self, pupil_id: Optional[str] = None) -> List[NewsItem]:
 		"""Get news items for a pupil.
 
-		Two real bugs fixed here (confirmed against live traffic — the account's
-		newest article was silently missing from every fetch, even right after a
-		fresh session):
-		  1. This used to GET the endpoint; the real frontend always POSTs to
-		     Communication/News/GetNewsList. A GET appears to hit a different
-		     server-side path that returns a stale/incomplete list rather than
-		     erroring, so the bug was invisible — it looked like "fewer items",
-		     not "broken".
-		  2. The real frontend always primes Communication/Communication/appData
-		     (action=news&tab=news) immediately before GetNewsList, the same
-		     pattern every Hub App module uses. This never did that priming call.
+		Root cause of the account's newest article being silently missing from
+		every fetch (confirmed against a real captured request/response pair,
+		not guessed): GetNewsList needs a POST body of
+		{"pageSize": -1, "sortBy": "lastPublishDate___SORT_DESC"}. Called with no
+		body at all — what this did before — the server quietly defaults to a
+		small page that can exclude the newest item, with no error, no HTML,
+		nothing to distinguish it from "there's just nothing new". Two earlier,
+		wrong guesses (switching GET to POST, adding appData priming) are kept
+		since the real frontend does both, but neither was the actual bug —
+		this pageSize/sortBy body is.
+
+		Also fixed: the article's author lives in the `publishedBy` field, not
+		`author` — confirmed from the same real response, explaining why every
+		article's author had always shown up empty.
 
 		Args:
 			pupil_id: Optional pupil ID. If provided, switches to that pupil first.
@@ -203,9 +206,8 @@ class InfoMentorClient:
 		if pupil_id:
 			await self.switch_pupil(pupil_id)
 
-		# Prime the server-side SPA session for this module, exactly as the real
-		# frontend does before every GetNewsList call. Best-effort — a priming
-		# failure shouldn't block the actual fetch below from being attempted.
+		# Prime the server-side SPA session for this module, matching the real
+		# frontend. Best-effort — a priming failure shouldn't block the fetch below.
 		try:
 			await self._get_hub_json(
 				"/communication/communication/appData?codename=communication&action=news&tab=news",
@@ -215,7 +217,11 @@ class InfoMentorClient:
 			_LOGGER.debug("News appData priming call failed (continuing anyway): %s", err)
 
 		try:
-			data = await self._get_hub_json("/Communication/News/GetNewsList", referer="/#/communication/news")
+			data = await self._get_hub_json(
+				"/Communication/News/GetNewsList",
+				referer="/#/communication/news",
+				json_body={"pageSize": -1, "sortBy": "lastPublishDate___SORT_DESC"},
+			)
 			return self._parse_news_data(data, pupil_id)
 		except InfoMentorDataError:
 			raise
@@ -224,14 +230,21 @@ class InfoMentorClient:
 		except json.JSONDecodeError as e:
 			raise InfoMentorDataError(f"Failed to parse news data: {e}") from e
 
-	async def _get_hub_json(self, path: str, *, method: str = "POST", referer: Optional[str] = None) -> Any:
+	async def _get_hub_json(
+		self, path: str, *, method: str = "POST", referer: Optional[str] = None, json_body: Optional[dict] = None
+	) -> Any:
 		"""POST/GET a Hub App endpoint and return parsed JSON, or raise on HTML/empty/error.
 
-		Shared by get_messages/get_calendar_entries/get_meeting_availabilities — same
-		content-type/HTML/empty-body handling get_news() uses, factored out since three
-		new endpoints need the identical checks. Field-level shape (dict wrapped in a
-		top-level key vs. a bare list) is not yet confirmed against live data for these
-		three; callers unwrap defensively.
+		Shared by get_news/get_messages/get_calendar_entries/get_meeting_availabilities.
+
+		json_body matters more than it looks: confirmed live that GetNewsList silently
+		defaults to a small page when called with no body at all (returned 4 items,
+		missing the account's actual newest article) versus the real frontend's body of
+		{"pageSize": -1, "sortBy": "lastPublishDate___SORT_DESC"} (returns everything).
+		No response-shape or error signals this — it just quietly looks like "nothing
+		new" to every caller. get_messages/get_calendar_entries/get_meeting_availabilities
+		pass pageSize: -1 defensively for the same reason, though their exact body
+		shape (e.g. the sortBy value) isn't confirmed live the way news now is.
 		"""
 		url = f"{HUB_BASE_URL}{path}"
 		headers = DEFAULT_HEADERS.copy()
@@ -243,8 +256,11 @@ class InfoMentorClient:
 			headers["Referer"] = f"{HUB_BASE_URL}{referer}"
 
 		request_fn = self._session.post if method == "POST" else self._session.get
+		request_kwargs = {"headers": headers}
+		if json_body is not None and method == "POST":
+			request_kwargs["json"] = json_body
 		try:
-			async with request_fn(url, headers=headers) as resp:
+			async with request_fn(url, **request_kwargs) as resp:
 				if resp.status != 200:
 					raise InfoMentorAPIError(f"{path} returned HTTP {resp.status}")
 
@@ -289,7 +305,7 @@ class InfoMentorClient:
 		if pupil_id:
 			await self.switch_pupil(pupil_id)
 
-		data = await self._get_hub_json("/Message/message/GetMessages", referer="/#/message")
+		data = await self._get_hub_json("/Message/message/GetMessages", referer="/#/message", json_body={"pageSize": -1})
 		items = self._unwrap_items(data, "items", "messages", "threads")
 
 		messages: List[Message] = []
@@ -318,7 +334,7 @@ class InfoMentorClient:
 		if pupil_id:
 			await self.switch_pupil(pupil_id)
 
-		data = await self._get_hub_json("/calendarv2/calendarv2/getentries", referer="/#/calendarv2/whole_week")
+		data = await self._get_hub_json("/calendarv2/calendarv2/getentries", referer="/#/calendarv2/whole_week", json_body={"pageSize": -1})
 		items = self._unwrap_items(data, "items", "entries", "events")
 
 		entries: List[CalendarEntry] = []
@@ -350,7 +366,7 @@ class InfoMentorClient:
 		if pupil_id:
 			await self.switch_pupil(pupil_id)
 
-		data = await self._get_hub_json("/Home/meeting/GetPupilAvailabilities", referer="/#/meeting")
+		data = await self._get_hub_json("/Home/meeting/GetPupilAvailabilities", referer="/#/meeting", json_body={"pageSize": -1})
 		items = self._unwrap_items(data, "items", "availabilities", "slots")
 
 		slots: List[MeetingAvailability] = []
@@ -1399,10 +1415,16 @@ class InfoMentorClient:
 		news_items = []
 		
 		try:
-			# The exact structure will depend on the actual API response
-			# This is a template that should be adjusted based on real data
+			# Confirmed against a real GetNewsList response (2026-09-03): top-level
+			# {"items": [...]}, each item carrying id/title/content/publishedDate as
+			# already assumed here, plus publishedBy for the author (not "author" —
+			# that key doesn't exist in the real response, which is why author had
+			# always come through empty) and publishedDateString/newsImageUrl/
+			# newsThumbnailImageUrl/attachments, none of which NewsItem currently
+			# models. No "category" key exists in real data either; that lookup is
+			# harmless (falls through to None) but never populates anything.
 			items = data.get("items", []) if isinstance(data, dict) else []
-			
+
 			for item in items:
 				try:
 					news_item = NewsItem(
@@ -1410,7 +1432,7 @@ class InfoMentorClient:
 						title=item.get("title", ""),
 						content=item.get("content", ""),
 						published_date=self._parse_date(item.get("publishedDate", item.get("date"))),
-						author=item.get("author"),
+						author=item.get("publishedBy", item.get("author")),
 						category=item.get("category"),
 						pupil_id=pupil_id
 					)
