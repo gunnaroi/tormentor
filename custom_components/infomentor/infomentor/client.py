@@ -288,6 +288,17 @@ class InfoMentorClient:
 
 		Returns all notifications for the current session (all pupils).
 
+		NotificationApp/appData is only a session-priming call, like every other
+		Hub App module (compare Communication/News, which primes via its own
+		appData before GetNewsList) — it legitimately returns an empty 200 body
+		and was never the notifications payload. The real data lives at
+		NotificationApp/NotificationApp/GetNotifications, confirmed by inspecting
+		the actual requests minn.infomentor.is's own frontend makes when opening
+		the notifications panel. Calling appData as the primary endpoint (as this
+		function used to) works by accident on backends that still fold the
+		payload into appData's response, and silently returns nothing once a
+		backend splits the two the way minn.infomentor.is currently does.
+
 		InfoMentor's hub returns:
 		  - HTTP 500 when the session is completely invalid
 		  - HTTP 200 with HTML when the cookie is present but expired
@@ -299,7 +310,7 @@ class InfoMentorClient:
 		"""
 		self._ensure_authenticated()
 
-		url = f"{HUB_BASE_URL}/NotificationApp/NotificationApp/appData"
+		url = f"{HUB_BASE_URL}/NotificationApp/NotificationApp/GetNotifications"
 		headers = DEFAULT_HEADERS.copy()
 		headers.update({
 			"Accept": "application/json, text/javascript, */*; q=0.01",
@@ -357,7 +368,14 @@ class InfoMentorClient:
 						await _debug_dump(f"{method.lower()}_jsonerr", status, content_type, text)
 						return None
 
-					raw_items = data.get("notifications", []) if isinstance(data, dict) else []
+					if isinstance(data, list):
+						raw_items = data
+					elif isinstance(data, dict):
+						raw_items = data.get("notifications", [])
+						if not isinstance(raw_items, list):
+							raw_items = []
+					else:
+						raw_items = []
 					notifications: List[InfoMentorNotification] = []
 					for item in raw_items:
 						try:
@@ -389,7 +407,7 @@ class InfoMentorClient:
 			return result
 
 		_LOGGER.warning("Notification endpoint returned no usable data after warmup + POST/GET attempts")
-		return []
+		raise InfoMentorDataError("Notification endpoint returned no usable data after warmup + POST/GET attempts")
 
 	async def get_timeline(self, pupil_id: Optional[str] = None, page: int = 1, page_size: int = 50) -> List[TimelineEntry]:
 		"""Get timeline entries for a pupil.
