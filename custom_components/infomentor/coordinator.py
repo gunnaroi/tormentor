@@ -57,6 +57,12 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		self.storage = InfoMentorStorage(hass, entry_id)
 		self._last_successful_update: Optional[datetime] = None
 		self._using_cached_data = False
+		# One-shot override for the next _async_update_data() call: skip the
+		# has_recent_data(<=72h) storage-cache short-circuit and force a real live
+		# fetch. Without this, the diagnostics buttons' re-login/warmup work was
+		# being thrown away — _async_update_data() hit the cache check first and
+		# returned old storage data regardless of how fresh the session was.
+		self._force_live_refresh = False
 		self._last_auth_check: Optional[datetime] = None
 		
 		# Smart retry tracking
@@ -98,12 +104,19 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		
 	async def _async_update_data(self) -> Dict[str, Any]:
 		"""Update data via library."""
+		# Consume the one-shot force-live-refresh flag now, regardless of which
+		# branch below runs — it must not survive past this single call.
+		force_live_refresh = self._force_live_refresh
+		self._force_live_refresh = False
+		if force_live_refresh:
+			_LOGGER.info("Force-live-refresh requested; bypassing the <=72h storage-cache short-circuit for this update")
+
 		# Try to load cached data first (this loads pupil IDs and names too)
 		await self._load_cached_data_if_needed()
-		
+
 		try:
 			# Check if we have recent cached data - if so, skip auth at startup
-			if await self.storage.has_recent_data(max_age_hours=72):
+			if not force_live_refresh and await self.storage.has_recent_data(max_age_hours=72):
 				# Load the actual cached pupil data from storage if we don't have it yet
 				if not self.data:
 					cached_data = await self.storage.get_cached_pupil_data()
@@ -145,7 +158,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			if not self.client or not hasattr(self.client, 'auth') or not self.client.auth.authenticated:
 				_LOGGER.debug("Setting up client (not initialized or not authenticated)")
 				try:
-					await self._setup_client()
+					await self._setup_client(force_live_refresh=force_live_refresh)
 				except (InfoMentorAuthError, InfoMentorConnectionError) as e:
 					_LOGGER.warning(f"Failed to setup client: {e}")
 					# Keep using existing data if available
@@ -164,7 +177,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 				# Additional validation - check if we have pupil IDs
 				if not self.client.auth.pupil_ids:
 					_LOGGER.warning("No pupil IDs available after authentication - re-initializing client")
-					await self._setup_client()
+					await self._setup_client(force_live_refresh=force_live_refresh)
 					
 					# If still no pupil IDs after re-setup, this indicates a more serious issue
 					if not self.client.auth.pupil_ids:
@@ -177,7 +190,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 						_LOGGER.info(f"Successfully recovered pupil IDs after re-initialization: {len(self.client.auth.pupil_ids)} pupils found")
 			except Exception as auth_err:
 				_LOGGER.warning(f"Re-authentication failed, setting up new client: {auth_err}")
-				await self._setup_client()
+				await self._setup_client(force_live_refresh=force_live_refresh)
 			
 			# Final validation before attempting data retrieval
 			if not self.pupil_ids:
@@ -307,11 +320,17 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			
 			raise UpdateFailed(f"Unexpected error: {err}") from err
 			
-	async def _setup_client(self) -> None:
-		"""Set up the InfoMentor client with retry logic for pupil ID retrieval."""
+	async def _setup_client(self, *, force_live_refresh: bool = False) -> None:
+		"""Set up the InfoMentor client with retry logic for pupil ID retrieval.
+
+		force_live_refresh: skip both the maintenance-window and the general
+		cached-data shortcuts below, matching _async_update_data's own bypass —
+		otherwise a forced refresh requested during the first 5 minutes of an
+		hour would still silently fall back to cached data.
+		"""
 		# Check if we're in the first 5 minutes of an hour (suspected server maintenance window)
 		now = datetime.now()
-		if now.minute < 5:
+		if not force_live_refresh and now.minute < 5:
 			# Check if we have recent cached data to use instead
 			if await self.storage.has_recent_data(max_age_hours=24):
 				_LOGGER.info(f"Avoiding authentication during first 5 minutes of hour (suspected maintenance window) - using cached data")
@@ -1458,6 +1477,10 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			self._last_schedule_cache_update = None
 			_LOGGER.warning("Diagnostics poke: cleared in-memory schedule cache")
 
+		# Without this, everything above (re-login, hub warmup) was wasted work —
+		# _async_update_data() hits its own <=72h storage-cache short-circuit
+		# first and returns old data regardless of how fresh the session is.
+		self._force_live_refresh = True
 		await self.async_refresh()
 
 		# The cached-data path inside `_async_update_data` fires
@@ -1504,7 +1527,9 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		self._auth_failure_count = 0
 		self._last_auth_failure = None
 		
-		# Force immediate update
+		# Force immediate update — bypass the <=72h storage-cache short-circuit too,
+		# otherwise "force" refresh silently returns the same old cached data.
+		self._force_live_refresh = True
 		await self.async_refresh()
 		_LOGGER.info("Force refresh completed")
 
