@@ -457,3 +457,12 @@ logger:
 ## Support
 
 For issues and feature requests, please check the logs first and include relevant debug information when reporting problems.
+# Request pacing (1.1.5)
+
+Normal coordinator refreshes remain 12-hourly. Failure retries are hourly,
+with at most two pupil-discovery attempts separated by 30 seconds. Runtime
+requests are serialized per account and spaced at least one second apart.
+HTTP 429 (or 503 with Retry-After) stops subsequent requests until the server's
+Retry-After seconds/date expires; missing or invalid values default to an hour.
+Cooldowns are held in memory and reset when the integration is reloaded.
+These limits reduce traffic; they do not constitute provider authorization.

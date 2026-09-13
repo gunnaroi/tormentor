@@ -14,10 +14,10 @@ DEFAULT_SCAN_INTERVAL = timedelta(hours=12)
 
 # Retry scheduling - simplified and more aggressive
 RETRY_INTERVAL_HOURS = 1  # Retry every hour if data is missing or authentication fails
-RETRY_INTERVAL_MINUTES_FAST = 15  # Fast retry for immediate issues (first few attempts)
-MAX_FAST_RETRIES = 3  # Number of fast retries before switching to hourly
-AUTH_BACKOFF_MINUTES = 15  # Reduced backoff time for authentication failures
-MAX_AUTH_FAILURES_BEFORE_BACKOFF = 5  # Allow more auth failures before backing off
+RETRY_INTERVAL_MINUTES_FAST = 60
+MAX_FAST_RETRIES = 1
+AUTH_BACKOFF_MINUTES = 60
+MAX_AUTH_FAILURES_BEFORE_BACKOFF = 1
 
 # Smart retry scheduling
 FIRST_ATTEMPT_HOUR = 2  # First attempt at 2 AM

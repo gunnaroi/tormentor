@@ -16,6 +16,7 @@ from .infomentor.client import InfoMentorClient
 from .infomentor.exceptions import InfoMentorAuthError, InfoMentorConnectionError
 from .infomentor.models import NewsItem, TimelineEntry, PupilInfo, ScheduleDay, TimetableEntry, TimeRegistrationEntry, InfoMentorNotification, Message, CalendarEntry, MeetingAvailability
 from .storage import InfoMentorStorage
+from .rate_limit import RateLimitedSession
 from .schedule_guard import (
 	SCHEDULE_STATUS_CACHED,
 	SCHEDULE_STATUS_FRESH,
@@ -353,7 +354,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		
 		if not self._session:
 			# Use Home Assistant's properly configured client session with timeouts
-			self._session = async_get_clientsession(self.hass)
+			self._session = RateLimitedSession(async_get_clientsession(self.hass))
 			
 		self.client = InfoMentorClient(self._session, self.storage)
 		
@@ -376,10 +377,12 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		
 		# Get pupil IDs with retry logic for transient failures
 		# If authentication succeeds but we get no pupils, that's an InfoMentor server issue
-		max_retries = 5  # Increased retries for server issues
-		retry_delay = 3.0  # Start with 3 seconds
+		max_retries = 2
+		retry_delay = 30.0
 		
 		for attempt in range(max_retries):
+			if self._session.cooldown_remaining:
+				raise InfoMentorConnectionError("Server cooldown active")
 			try:
 				self.pupil_ids = await self.client.get_pupil_ids()
 				if self.pupil_ids:
