@@ -33,6 +33,7 @@ For each pupil, the integration creates several sensors:
 - **Timeline**: Count and details of timeline entries
 - **Latest News**: Latest news title and content in a dashboard/Assist/MCP-friendly state
 - **Latest Timeline or Homework**: Latest timeline entry title and content
+- **Latest Message**: Latest direct-message subject and plain-text body. The inbox is account-wide; this summary currently appears for each pupil, but the message is not verified as addressed to that pupil (`message_scope: account`).
 - **Next Class**: Date, time, and subject of the next class
 - **Today Schedule Summary**: A concise summary of today's complete class schedule
 - **Attendance**: Latest historical attendance record, with up to 20 detailed records in attributes

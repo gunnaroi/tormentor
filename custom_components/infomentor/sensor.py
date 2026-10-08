@@ -407,7 +407,8 @@ class InfoMentorLatestMessageSummarySensor(InfoMentorPupilSensorBase):
 	@property
 	def extra_state_attributes(self) -> Dict[str, Any]:
 		entry = self.coordinator.get_latest_message(self.pupil_id)
-		attributes = {ATTR_PUPIL_ID: self.pupil_id, ATTR_PUPIL_NAME: self.pupil_name}
+		attributes = {ATTR_PUPIL_ID: self.pupil_id, ATTR_PUPIL_NAME: self.pupil_name,
+			"message_scope": "account", "recipient_pupil_unverified": True}
 		if entry:
 			attributes.update({
 				"subject": entry.subject,

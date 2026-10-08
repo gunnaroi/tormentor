@@ -37,6 +37,7 @@ STORAGE_KEY = "infomentor_cache"
 DATA_RETENTION_DAYS = 14  # Keep data for 2 weeks
 AUTH_COOKIE_KEY = "auth_cookies"
 AUTH_COOKIE_TS_KEY = "auth_cookies_updated"
+RATE_LIMIT_UNTIL_KEY = "rate_limit_until"
 LAST_COMPLETE_SCHEDULE_UPDATE_KEY = "last_complete_schedule_update"
 SELECTED_SCHOOL_NUMBER_KEY = "selected_school_number"
 
@@ -73,6 +74,7 @@ class InfoMentorStorage:
 					SELECTED_SCHOOL_NUMBER_KEY: None,
 					AUTH_COOKIE_KEY: {},
 					AUTH_COOKIE_TS_KEY: None,
+					RATE_LIMIT_UNTIL_KEY: None,
 				}
 			else:
 				self._data = stored_data
@@ -81,11 +83,26 @@ class InfoMentorStorage:
 				self._data.setdefault(SELECTED_SCHOOL_NUMBER_KEY, None)
 				self._data.setdefault(AUTH_COOKIE_KEY, {})
 				self._data.setdefault(AUTH_COOKIE_TS_KEY, None)
+				self._data.setdefault(RATE_LIMIT_UNTIL_KEY, None)
 				self._data.setdefault(LAST_COMPLETE_SCHEDULE_UPDATE_KEY, None)
 				# Clean up old data
 				await self._cleanup_old_data()
 		
 		return self._data
+
+	async def get_rate_limit_until(self) -> float:
+		"""Return the stored cooldown deadline as Unix seconds."""
+		data = await self.async_load()
+		try:
+			return float(data.get(RATE_LIMIT_UNTIL_KEY) or 0)
+		except (TypeError, ValueError):
+			return 0
+
+	async def set_rate_limit_until(self, deadline: float) -> None:
+		"""Persist a server requested cooldown across Home Assistant restarts."""
+		data = await self.async_load()
+		data[RATE_LIMIT_UNTIL_KEY] = deadline
+		await self._store.async_save(data)
 	
 	async def async_save(
 		self,
@@ -259,6 +276,7 @@ class InfoMentorStorage:
 					SELECTED_SCHOOL_NUMBER_KEY: None,
 					AUTH_COOKIE_KEY: {},
 					AUTH_COOKIE_TS_KEY: None,
+					RATE_LIMIT_UNTIL_KEY: self._data.get(RATE_LIMIT_UNTIL_KEY),
 				}
 				await self._store.async_save(self._data)
 		except (ValueError, TypeError) as e:
@@ -359,4 +377,3 @@ class InfoMentorStorage:
 		self._data[AUTH_COOKIE_TS_KEY] = None
 		await self._store.async_save(self._data)
 		_LOGGER.debug("Cleared stored authentication cookies")
-

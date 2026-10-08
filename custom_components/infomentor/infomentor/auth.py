@@ -12,6 +12,7 @@ from urllib.parse import urljoin as _urljoin, urlparse, parse_qs, urlencode
 
 from .exceptions import InfoMentorAuthError, InfoMentorConnectionError
 from .form_utils import ParsedForm, build_login_form_data, extract_hidden_fields, parse_forms, select_login_form
+from .pupil_context import selected_pupil_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -352,6 +353,7 @@ class InfoMentorAuth:
 		self.pupil_ids: list[str] = []
 		self.pupil_names: dict[str, str] = {}  # Maps pupil_id -> pupil_name
 		self.pupil_switch_ids: dict[str, str] = {}  # Maps pupil_id -> switch_id
+		self.selected_pupil_id: Optional[str] = None
 		self._last_auth_time: Optional[float] = None
 		self._auth_cookies_backup: Optional[Dict[str, str]] = None
 		self._username: Optional[str] = None
@@ -437,6 +439,12 @@ class InfoMentorAuth:
 			import time
 			self.authenticated = True
 			self._last_auth_time = time.time()
+			# Restored cookies do not restore the in-memory pupil list or switch IDs.
+			# Rebuild both before any per-pupil read can use this session.
+			self.pupil_ids = await self.storage.get_pupil_ids()
+			if not self.pupil_ids:
+				self.pupil_ids = await self._get_pupil_ids_modern()
+			await self._build_switch_id_mapping()
 			_LOGGER.info("Reused stored InfoMentor cookies; skipping full authentication")
 			return True
 		
@@ -2204,6 +2212,7 @@ class InfoMentorAuth:
 			async with self.session.get(hub_url, headers=headers) as resp:
 				if resp.status == 200:
 					html = await resp.text()
+					self.selected_pupil_id = selected_pupil_id(html)
 					
 					# Extract switch URLs and pupil names
 					switch_pattern = r'"switchPupilUrl"\s*:\s*"[^"]*SwitchPupil/(\d+)"[^}]*"name"\s*:\s*"([^"]+)"'
@@ -2238,6 +2247,21 @@ class InfoMentorAuth:
 		except Exception as e:
 			_LOGGER.warning(f"Failed to build switch ID mapping: {e}")
 			# Don't fail authentication if switch mapping fails
+
+	async def _confirm_selected_pupil(self, pupil_id: str) -> bool:
+		"""Read back the parent page after a switch before attributing data."""
+		try:
+			async with self.session.get(f"{HUB_BASE_URL}/", headers=DEFAULT_HEADERS) as resp:
+				if resp.status != 200:
+					return False
+				selected = selected_pupil_id(await resp.text())
+				self.selected_pupil_id = selected
+				return selected == pupil_id
+		except asyncio.CancelledError:
+			raise
+		except Exception as err:
+			_LOGGER.warning("Could not verify selected pupil: %s", err)
+			return False
 	
 	async def switch_pupil(self, pupil_id: str) -> bool:
 		"""Switch to a specific pupil context.
@@ -2250,6 +2274,8 @@ class InfoMentorAuth:
 		"""
 		if pupil_id not in self.pupil_ids:
 			raise InfoMentorAuthError(f"Invalid pupil ID: {pupil_id}")
+		if self.selected_pupil_id == pupil_id:
+			return True
 		
 		# Use the correct switch ID, not the pupil ID
 		switch_id = self.pupil_switch_ids.get(pupil_id, pupil_id)  # fallback to pupil_id if no mapping
@@ -2272,9 +2298,9 @@ class InfoMentorAuth:
 				success = resp.status in [200, 302]
 				if success:
 					_LOGGER.debug(f"Successfully switched to pupil {pupil_id} via hub endpoint (status: {resp.status})")
-					# Add a longer delay to ensure the switch takes effect on server side
-					await asyncio.sleep(2.0)
-					return True
+					if await self._confirm_selected_pupil(pupil_id):
+						return True
+					_LOGGER.warning("Hub switch did not select pupil %s; trying fallback", pupil_id)
 				else:
 					if resp.status == 400:
 						response_text = await resp.text()
@@ -2286,7 +2312,7 @@ class InfoMentorAuth:
 			_LOGGER.warning(f"Hub switch timed out for pupil {pupil_id} (switch ID {switch_id}) after 30 seconds")
 		except asyncio.CancelledError:
 			_LOGGER.warning(f"Hub switch was cancelled for pupil {pupil_id} (switch ID {switch_id})")
-			# Don't re-raise cancellation immediately, try the fallback first
+			raise
 		except Exception as e:
 			_LOGGER.warning(f"Hub switch failed for pupil {pupil_id} (switch ID {switch_id}) with exception: {e}")
 		
@@ -2300,9 +2326,7 @@ class InfoMentorAuth:
 				success = resp.status in [200, 302]
 				if success:
 					_LOGGER.debug(f"Successfully switched to pupil {pupil_id} via modern endpoint (status: {resp.status})")
-					# Add a longer delay to ensure the switch takes effect
-					await asyncio.sleep(2.0)
-					return True
+					return await self._confirm_selected_pupil(pupil_id)
 				else:
 					_LOGGER.warning(f"Modern switch failed for pupil {pupil_id} (switch ID {switch_id}): {resp.status}")
 		except asyncio.TimeoutError:

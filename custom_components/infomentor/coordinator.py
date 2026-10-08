@@ -215,14 +215,22 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			data = {}
 			any_today_schedule = False
 			
-			# Get data for each pupil
-			for pupil_id in self.pupil_ids:
-				pupil_data = await self._get_pupil_data(pupil_id)
-				data[pupil_id] = pupil_data
-				
-				# Check if we got today's schedule data
-				if pupil_data.get("today_schedule"):
-					any_today_schedule = True
+			# Restore the parent's original selection after a multi-pupil scan.
+			original_pupil = self.client.auth.selected_pupil_id if self.client and self.client.auth else None
+			try:
+				for pupil_id in self.pupil_ids:
+					pupil_data = await self._get_pupil_data(pupil_id)
+					data[pupil_id] = pupil_data
+					if pupil_data.get("today_schedule"):
+						any_today_schedule = True
+			finally:
+				if original_pupil and self.client and self.client.auth:
+					if self.client.auth.selected_pupil_id != original_pupil:
+						try:
+							if not await self.client.switch_pupil(original_pupil):
+								_LOGGER.warning("Could not restore original pupil selection")
+						except Exception as err:
+							_LOGGER.warning("Could not restore original pupil selection: %s", err)
 			
 			is_complete_schedule, missing_pupils, stale_pupils = evaluate_schedule_completeness(self.pupil_ids, data)
 			
@@ -354,7 +362,11 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		
 		if not self._session:
 			# Use Home Assistant's properly configured client session with timeouts
-			self._session = RateLimitedSession(async_get_clientsession(self.hass))
+			self._session = RateLimitedSession(
+				async_get_clientsession(self.hass),
+				persisted_until=await self.storage.get_rate_limit_until(),
+				on_cooldown=self.storage.set_rate_limit_until,
+			)
 			
 		self.client = InfoMentorClient(self._session, self.storage)
 		
@@ -481,6 +493,11 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			"calendar_entries": [],
 			"meeting_availabilities": [],
 		}
+		previous = self.data.get(pupil_id, {}) if isinstance(self.data, dict) else {}
+		def retain_previous(source: str) -> None:
+			"""A failed optional feed must not erase its last known good value."""
+			if isinstance(previous.get(source), list):
+				pupil_data[source] = previous[source]
 
 		# Track which data sources succeeded
 		success_count = 0
@@ -495,6 +512,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 
 		except Exception as err:
 			_LOGGER.warning(f"Failed to get news for pupil {pupil_id}: {err}")
+			retain_previous("news")
 
 		try:
 			# Get direct messages (Skilaboð) — not counted in total_sources/success_count
@@ -505,6 +523,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			_LOGGER.debug(f"Retrieved {len(messages)} messages for pupil {pupil_id}")
 		except Exception as err:
 			_LOGGER.debug(f"Failed to get messages for pupil {pupil_id}: {err}")
+			retain_previous("messages")
 
 		try:
 			# Get general calendar entries (Dagatal)
@@ -513,6 +532,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			_LOGGER.debug(f"Retrieved {len(calendar_entries)} calendar entries for pupil {pupil_id}")
 		except Exception as err:
 			_LOGGER.debug(f"Failed to get calendar entries for pupil {pupil_id}: {err}")
+			retain_previous("calendar_entries")
 
 		try:
 			# Get open parent-teacher meeting slots (Fundarbókun)
@@ -521,6 +541,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			_LOGGER.debug(f"Retrieved {len(availabilities)} meeting availabilities for pupil {pupil_id}")
 		except Exception as err:
 			_LOGGER.debug(f"Failed to get meeting availabilities for pupil {pupil_id}: {err}")
+			retain_previous("meeting_availabilities")
 
 		try:
 			# Get timeline
@@ -531,6 +552,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			
 		except Exception as err:
 			_LOGGER.warning(f"Failed to get timeline for pupil {pupil_id}: {err}")
+			retain_previous("timeline")
 
 		# Attendance is optional: failures here must never affect schedule
 		# completeness, freshness timestamps, or the primary success count.
@@ -544,6 +566,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 			)
 		except Exception as err:
 			_LOGGER.debug("Failed to get optional attendance for pupil %s: %s", pupil_id, err)
+			retain_previous("attendance")
 			
 		try:
 			# Get schedule (timetable and time registration)
@@ -652,6 +675,7 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 				"pupil_info": None,
 				"news": [],
 				"timeline": [],
+				"messages": [],
 				"attendance": [
 					item for item in pupil_data.get("attendance", []) if isinstance(item, dict)
 				],
@@ -701,6 +725,22 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 						))
 					except Exception as e:
 						_LOGGER.debug(f"Failed to deserialize timeline entry: {e}")
+
+			# Keep the latest message available through a restart or short outage.
+			for message_dict in pupil_data.get("messages", []):
+				if isinstance(message_dict, dict):
+					try:
+						deserialized_pupil_data["messages"].append(Message(
+							id=str(message_dict["id"]),
+							subject=message_dict.get("subject", ""),
+							body=message_dict.get("body", ""),
+							date=datetime.fromisoformat(message_dict["date"]),
+							sender=message_dict.get("sender"),
+							unread=bool(message_dict.get("unread", False)),
+							pupil_id=None,
+						))
+					except (KeyError, TypeError, ValueError):
+						_LOGGER.debug("Skipped invalid cached message")
 			
 			# Deserialize schedule days
 			for day_dict in pupil_data.get("schedule", []):

@@ -16,6 +16,31 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(module.retry_delay("bad"), 3600)
         self.assertEqual(module.retry_delay("Thu, 01 Jan 1970 00:02:00 GMT", 0), 120)
         self.assertEqual(module.retry_delay("nan"), 3600)
+        self.assertEqual(module.retry_delay("86400"), 3600)
+
+    async def test_persisted_cooldown_survives_new_session(self):
+        saved = []
+        now = [1000.0]
+        @asynccontextmanager
+        async def request(method, url, **kwargs):
+            yield SimpleNamespace(status=429, headers={"Retry-After": "120"})
+        async def persist(deadline):
+            saved.append(deadline)
+        first = module.RateLimitedSession(
+            SimpleNamespace(request=request), clock=lambda: now[0],
+            wall_clock=lambda: now[0], on_cooldown=persist,
+        )
+        with self.assertRaises(RuntimeError):
+            async with first.get("https://example.invalid"):
+                pass
+        self.assertEqual(saved, [1120.0])
+        restarted = module.RateLimitedSession(
+            SimpleNamespace(request=request), clock=lambda: now[0],
+            wall_clock=lambda: now[0], persisted_until=saved[0],
+        )
+        self.assertEqual(restarted.cooldown_remaining, 120)
+        now[0] += 120
+        self.assertEqual(restarted.cooldown_remaining, 0)
 
     async def test_cooldown_blocks_fallback_and_releases_response(self):
         for status in (429, 503):

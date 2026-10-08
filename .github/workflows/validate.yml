@@ -11,6 +11,20 @@ permissions:
   contents: read
 
 jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Test pure parsing, summaries, and rate limiting
+        run: |
+          python -m unittest discover -s tests -p 'test_message_parsing.py'
+          python -m unittest discover -s tests -p 'test_pupil_context.py'
+          python -m unittest discover -s tests -p 'test_rate_limit.py'
+          python -m unittest discover -s tests -p 'test_summary_helpers.py'
+
   hassfest:
     runs-on: ubuntu-latest
     steps:

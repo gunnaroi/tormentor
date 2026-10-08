@@ -17,17 +17,20 @@ def retry_delay(value, now=None):
             return 3600
     if not (0 <= seconds < float("inf")):
         return 3600
-    return max(60, seconds)
+    return min(3600, max(60, seconds))
 
 
 class RateLimitedSession:
     """Wrap only this integration's session access, never mutate HA's session."""
 
-    def __init__(self, session, clock=time.monotonic, sleep=asyncio.sleep):
+    def __init__(self, session, clock=time.monotonic, sleep=asyncio.sleep,
+                 persisted_until=0, wall_clock=time.time, on_cooldown=None):
         self._session = session
         self._clock = clock
         self._sleep = sleep
-        self._blocked_until = 0
+        self._wall_clock = wall_clock
+        self._on_cooldown = on_cooldown
+        self._blocked_until = self._clock() + min(3600, max(0, persisted_until - wall_clock()))
         self._next_request = 0
         self._lock = asyncio.Lock()
 
@@ -48,7 +51,10 @@ class RateLimitedSession:
                 self._next_request = self._clock() + 1
                 response = await stack.enter_async_context(self._session.request(method, url, **kwargs))
                 if response.status == 429 or (response.status == 503 and response.headers.get("Retry-After")):
-                    self._blocked_until = self._clock() + retry_delay(response.headers.get("Retry-After"))
+                    delay = retry_delay(response.headers.get("Retry-After"), self._wall_clock())
+                    self._blocked_until = self._clock() + delay
+                    if self._on_cooldown is not None:
+                        await self._on_cooldown(self._wall_clock() + delay)
                     raise RuntimeError("InfoMentor requested a cooldown; further requests suspended")
             # Authentication can make nested requests while reading a response.
             yield response

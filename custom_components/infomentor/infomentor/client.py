@@ -15,6 +15,7 @@ from .models import (
 	InfoMentorNotification, Message, CalendarEntry, MeetingAvailability,
 )
 from .exceptions import InfoMentorAPIError, InfoMentorConnectionError, InfoMentorDataError, InfoMentorAuthError
+from .message_parsing import MessageFormatError, parse_message_list
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -231,7 +232,8 @@ class InfoMentorClient:
 			raise InfoMentorDataError(f"Failed to parse news data: {e}") from e
 
 	async def _get_hub_json(
-		self, path: str, *, method: str = "POST", referer: Optional[str] = None, json_body: Optional[dict] = None
+		self, path: str, *, method: str = "POST", referer: Optional[str] = None,
+		json_body: Optional[dict] = None, form_body: Optional[dict] = None,
 	) -> Any:
 		"""POST/GET a Hub App endpoint and return parsed JSON, or raise on HTML/empty/error.
 
@@ -241,11 +243,12 @@ class InfoMentorClient:
 		defaults to a small page when called with no body at all (returned 4 items,
 		missing the account's actual newest article) versus the real frontend's body of
 		{"pageSize": -1, "sortBy": "lastPublishDate___SORT_DESC"} (returns everything).
-		No response-shape or error signals this — it just quietly looks like "nothing
-		new" to every caller. get_messages/get_calendar_entries/get_meeting_availabilities
-		pass pageSize: -1 defensively for the same reason, though their exact body
-		shape (e.g. the sortBy value) isn't confirmed live the way news now is.
+		No response-shape or error signals this — it quietly looks like "nothing new".
+		Other JSON endpoints still use pageSize: -1; the confirmed Message endpoint
+		uses form-encoded paging through form_body.
 		"""
+		if not path.startswith("/") or path.startswith("//"):
+			raise InfoMentorDataError("Invalid hub API path")
 		url = f"{HUB_BASE_URL}{path}"
 		# DEFAULT_HEADERS is built for a top-level page navigation (Sec-Fetch-Dest:
 		# document/Sec-Fetch-Mode: navigate/Sec-Fetch-Site: none, Sec-Fetch-User,
@@ -275,11 +278,17 @@ class InfoMentorClient:
 		headers["Referer"] = f"{HUB_BASE_URL}/"
 
 		request_fn = self._session.post if method == "POST" else self._session.get
-		request_kwargs = {"headers": headers}
+		request_kwargs = {"headers": headers, "allow_redirects": False}
+		if json_body is not None and form_body is not None:
+			raise ValueError("Provide either JSON or form data, not both")
 		if json_body is not None and method == "POST":
 			request_kwargs["json"] = json_body
+		if form_body is not None and method == "POST":
+			request_kwargs["data"] = form_body
 		try:
 			async with request_fn(url, **request_kwargs) as resp:
+				if 300 <= resp.status < 400:
+					raise InfoMentorAuthError(f"Session redirected fetching {path}")
 				if resp.status != 200:
 					raise InfoMentorAPIError(f"{path} returned HTTP {resp.status}")
 
@@ -288,7 +297,10 @@ class InfoMentorClient:
 					_LOGGER.warning("%s returned HTML — session may have expired", path)
 					raise InfoMentorAuthError(f"Session expired fetching {path}")
 
-				text = await resp.text()
+				body = await resp.content.read(8 * 1024 * 1024 + 1)
+				if len(body) > 8 * 1024 * 1024:
+					raise InfoMentorDataError(f"{path} returned an oversized response")
+				text = body.decode(resp.charset or "utf-8", errors="replace")
 				stripped = text.strip()
 				if not stripped:
 					_LOGGER.warning("%s returned empty body (content-type=%s)", path, content_type)
@@ -313,35 +325,37 @@ class InfoMentorClient:
 				value = data.get(key)
 				if isinstance(value, list):
 					return [item for item in value if isinstance(item, dict)]
-		return []
+		raise InfoMentorDataError("Unexpected InfoMentor list response format")
 
 	async def get_messages(self, pupil_id: Optional[str] = None) -> List[Message]:
-		"""Get direct message threads (Skilaboð) — parent/staff messaging, distinct
-		from News and from NotificationApp's activity feed. Not yet covered by any
-		existing sensor; response shape is best-effort until confirmed live.
+		"""Get the latest inbox messages, including the newest message body.
+
+		The Icelandic portal uses form-encoded paging and a separate detail request.
+		The inbox is account-wide even when a pupil is selected. Keep this bounded:
+		polling every message detail would be expensive.
 		"""
 		self._ensure_authenticated()
-		if pupil_id:
-			await self.switch_pupil(pupil_id)
 
-		data = await self._get_hub_json("/Message/message/GetMessages", referer="/#/message", json_body={"pageSize": -1})
-		items = self._unwrap_items(data, "items", "messages", "threads")
-
-		messages: List[Message] = []
-		for item in items:
-			try:
-				messages.append(Message(
-					id=str(item.get("id", item.get("threadId", ""))),
-					subject=item.get("subject", item.get("title", "")),
-					body=item.get("body", item.get("content", item.get("preview", ""))),
-					date=self._parse_date(item.get("date", item.get("createdDate", item.get("lastMessageDate")))),
-					sender=item.get("sender", item.get("from", item.get("author"))),
-					unread=bool(item.get("unread", not item.get("isRead", True))),
-					pupil_id=pupil_id,
-				))
-			except (KeyError, ValueError) as e:
-				_LOGGER.warning("Failed to parse message: %s", e)
-				continue
+		data = await self._get_hub_json(
+			"/Message/message/GetMessages",
+			form_body={"page": "1", "pageSize": "100", "messageText": "", "inbox": "true", "sentItems": "false"},
+		)
+		try:
+			rows, skipped = parse_message_list(data)
+		except MessageFormatError as err:
+			raise InfoMentorDataError(str(err)) from err
+		if skipped:
+			_LOGGER.warning("Skipped %d malformed message items", skipped)
+		# The message inbox is account-wide; selected child is not a recipient claim.
+		messages = [Message(**row, body="", pupil_id=None) for row in rows]
+		if messages:
+			latest = max(messages, key=lambda message: message.date)
+			detail = await self._get_hub_json(
+				"/Message/message/GetMessage", form_body={"id": latest.id}
+			)
+			if not isinstance(detail, dict) or str(detail.get("id")) != latest.id:
+				raise InfoMentorDataError("Unexpected message detail format")
+			latest.body = str(detail.get("messageBodyPlainText") or "")
 		return messages
 
 	async def get_calendar_entries(self, pupil_id: Optional[str] = None) -> List[CalendarEntry]:
@@ -1442,10 +1456,14 @@ class InfoMentorClient:
 			# newsThumbnailImageUrl/attachments, none of which NewsItem currently
 			# models. No "category" key exists in real data either; that lookup is
 			# harmless (falls through to None) but never populates anything.
-			items = data.get("items", []) if isinstance(data, dict) else []
+			if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+				raise InfoMentorDataError("Unexpected news list format")
+			items = data["items"]
 
 			for item in items:
 				try:
+					if not isinstance(item, dict) or not item.get("id") or not item.get("publishedDate"):
+						raise ValueError("Malformed news item")
 					news_item = NewsItem(
 						id=str(item.get("id", "")),
 						title=item.get("title", ""),
@@ -1459,7 +1477,11 @@ class InfoMentorClient:
 				except (KeyError, ValueError) as e:
 					_LOGGER.warning(f"Failed to parse news item: {e}")
 					continue
+			if items and not news_items:
+				raise InfoMentorDataError("No valid news in non-empty response")
 					
+		except InfoMentorDataError:
+			raise
 		except Exception as e:
 			_LOGGER.error(f"Failed to parse news data: {e}")
 			raise InfoMentorDataError(f"Failed to parse news data: {e}") from e
@@ -1479,10 +1501,14 @@ class InfoMentorClient:
 		timeline_entries = []
 		
 		try:
+			if not self._has_timeline_collection(data):
+				raise InfoMentorDataError("Unexpected timeline list format")
 			entries = self._find_timeline_entries(data)
 			
 			for entry in entries:
 				try:
+					if not isinstance(entry, dict) or not (entry.get("id") or entry.get("Id")):
+						raise ValueError("Malformed timeline item")
 					timeline_entry = TimelineEntry(
 						id=str(entry.get("id", entry.get("Id", ""))),
 						title=entry.get("title", entry.get("Title", entry.get("name", entry.get("Name", "")))),
@@ -1496,7 +1522,11 @@ class InfoMentorClient:
 				except (KeyError, ValueError) as e:
 					_LOGGER.warning(f"Failed to parse timeline entry: {e}")
 					continue
+			if entries and not timeline_entries:
+				raise InfoMentorDataError("No valid timeline entries in non-empty response")
 					
+		except InfoMentorDataError:
+			raise
 		except Exception as e:
 			_LOGGER.error(f"Failed to parse timeline data: {e}")
 			raise InfoMentorDataError(f"Failed to parse timeline data: {e}") from e
@@ -1504,19 +1534,31 @@ class InfoMentorClient:
 		return timeline_entries
 
 	@classmethod
+	def _has_timeline_collection(cls, data: Any) -> bool:
+		"""Distinguish an empty valid feed from an unfamiliar response shape."""
+		if isinstance(data, list):
+			return True
+		if not isinstance(data, dict):
+			return False
+		for key, value in data.items():
+			if key.lower() in {"entries", "items", "timelineentries", "grouptimelineentries", "results"} and isinstance(value, list):
+				return True
+			if key.lower() in {"data", "result", "response", "model"} and cls._has_timeline_collection(value):
+				return True
+		return False
+
+	@classmethod
 	def _find_timeline_entries(cls, data: Any) -> List[Dict[str, Any]]:
 		"""Find the timeline collection across API response casing/wrappers."""
 		if isinstance(data, list):
-			if not data or all(isinstance(item, dict) for item in data):
-				return data
-			return []
+			return data
 		if not isinstance(data, dict):
 			return []
 
 		preferred = {"entries", "items", "timelineentries", "grouptimelineentries", "results"}
 		for key, value in data.items():
 			if key.lower() in preferred and isinstance(value, list):
-				return [item for item in value if isinstance(item, dict)]
+				return value
 		for key in ("data", "result", "response", "model"):
 			for actual_key, value in data.items():
 				if actual_key.lower() == key:
