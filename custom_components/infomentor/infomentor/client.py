@@ -16,6 +16,7 @@ from .models import (
 )
 from .exceptions import InfoMentorAPIError, InfoMentorConnectionError, InfoMentorDataError, InfoMentorAuthError
 from .message_parsing import MessageFormatError, parse_message_list
+from .notification_parsing import NotificationFormatError, parse_notification_list
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -470,130 +471,24 @@ class InfoMentorClient:
 		return any_success
 
 	async def get_notifications(self) -> List[InfoMentorNotification]:
-		"""Fetch notifications from the InfoMentor NotificationApp.
+		"""Fetch notifications from the InfoMentor appData response.
 
-		Returns all notifications for the current session (all pupils).
-
-		NotificationApp/appData is only a session-priming call, like every other
-		Hub App module (compare Communication/News, which primes via its own
-		appData before GetNewsList) — it legitimately returns an empty 200 body
-		and was never the notifications payload. The real data lives at
-		NotificationApp/NotificationApp/GetNotifications, confirmed by inspecting
-		the actual requests minn.infomentor.is's own frontend makes when opening
-		the notifications panel. Calling appData as the primary endpoint (as this
-		function used to) works by accident on backends that still fold the
-		payload into appData's response, and silently returns nothing once a
-		backend splits the two the way minn.infomentor.is currently does.
-
-		InfoMentor's hub returns:
-		  - HTTP 500 when the session is completely invalid
-		  - HTTP 200 with HTML when the cookie is present but expired
-		  - HTTP 200 with an empty body when the server-side SPA session hasn't
-		    been primed yet (no prior "home init" call)
-		  - HTTP 200 with JSON when everything is healthy
-
-		If we get an empty/HTML/500 response we run the hub warm-up and retry once.
+		The live web app returns the notification array in appData. The separate
+		GetNotifications request is only a timestamp heartbeat and does not contain
+		the list, so it must not be parsed as an empty notification response.
 		"""
 		self._ensure_authenticated()
-
-		url = f"{HUB_BASE_URL}/NotificationApp/NotificationApp/GetNotifications"
-		headers = DEFAULT_HEADERS.copy()
-		headers.update({
-			"Accept": "application/json, text/javascript, */*; q=0.01",
-			"X-Requested-With": "XMLHttpRequest",
-			"Referer": f"{HUB_BASE_URL}/",
-			"Origin": HUB_BASE_URL,
-		})
-
-		async def _debug_dump(tag: str, status: int, content_type: str, text: str) -> None:
-			try:
-				import asyncio as _asyncio
-				path = f"/tmp/infomentor_notifications_{tag}.txt"
-				def _w():
-					with open(path, "w", encoding="utf-8") as f:
-						f.write(f"status={status}\ncontent-type={content_type}\n\n{text}")
-				await _asyncio.to_thread(_w)
-				_LOGGER.debug("Dumped notification response to %s", path)
-			except Exception as e:
-				_LOGGER.debug("Could not dump notification response: %s", e)
-
-		async def _do_request(method: str) -> Optional[List[InfoMentorNotification]]:
-			"""Return list on success, None if we should retry after warmup."""
-			request_fn = self._session.get if method == "GET" else self._session.post
-			try:
-				async with request_fn(url, headers=headers) as resp:
-					status = resp.status
-					content_type = resp.headers.get("content-type", "").lower()
-					text = await resp.text()
-
-					if status != 200:
-						_LOGGER.warning("Notification endpoint %s returned HTTP %s", method, status)
-						await _debug_dump(f"{method.lower()}_{status}", status, content_type, text)
-						return None
-
-					if "text/html" in content_type:
-						_LOGGER.warning("Notification endpoint %s returned HTML — session may have expired", method)
-						await _debug_dump(f"{method.lower()}_html", status, content_type, text)
-						return None
-
-					stripped = text.strip()
-					if not stripped:
-						_LOGGER.warning("Notification endpoint %s returned empty body (content-type=%s)", method, content_type)
-						await _debug_dump(f"{method.lower()}_empty", status, content_type, text)
-						return None
-
-					if not (stripped.startswith("{") or stripped.startswith("[")):
-						_LOGGER.warning("Notification endpoint %s returned non-JSON (%d chars)", method, len(text))
-						await _debug_dump(f"{method.lower()}_nonjson", status, content_type, text)
-						return None
-
-					try:
-						data = json.loads(stripped)
-					except json.JSONDecodeError as e:
-						_LOGGER.warning("Notification JSON parse failed (%s)", e)
-						await _debug_dump(f"{method.lower()}_jsonerr", status, content_type, text)
-						return None
-
-					if isinstance(data, list):
-						raw_items = data
-					elif isinstance(data, dict):
-						raw_items = data.get("notifications", [])
-						if not isinstance(raw_items, list):
-							raw_items = []
-					else:
-						raw_items = []
-					notifications: List[InfoMentorNotification] = []
-					for item in raw_items:
-						try:
-							notifications.append(InfoMentorNotification.from_dict(item))
-						except Exception as parse_err:
-							_LOGGER.debug("Failed to parse notification: %s", parse_err)
-
-					_LOGGER.debug("Fetched %d notifications via %s", len(notifications), method)
-					return notifications
-			except aiohttp.ClientError as e:
-				raise InfoMentorConnectionError(f"Connection error fetching notifications: {e}") from e
-
-		# InfoMentor's /NotificationApp/NotificationApp/appData endpoint currently
-		# requires POST; GET returns HTTP 500. We try POST first and fall back to
-		# GET + warm-up if the account happens to be one of the older variants.
-		result = await _do_request("POST")
-		if result is not None:
-			return result
-
-		_LOGGER.info("Notification POST failed; running hub warmup and trying GET fallback")
-		await self.warmup_hub_session()
-
-		result = await _do_request("POST")
-		if result is not None:
-			return result
-
-		result = await _do_request("GET")
-		if result is not None:
-			return result
-
-		_LOGGER.warning("Notification endpoint returned no usable data after warmup + POST/GET attempts")
-		raise InfoMentorDataError("Notification endpoint returned no usable data after warmup + POST/GET attempts")
+		data = await self._get_hub_json(
+			"/NotificationApp/NotificationApp/appData",
+			referer="/",
+		)
+		try:
+			raw_items, skipped = parse_notification_list(data)
+		except NotificationFormatError as err:
+			raise InfoMentorDataError(str(err)) from err
+		if skipped:
+			_LOGGER.warning("Skipped %d malformed InfoMentor notification items", skipped)
+		return [InfoMentorNotification.from_dict(item) for item in raw_items]
 
 	async def get_timeline(self, pupil_id: Optional[str] = None, page: int = 1, page_size: int = 50) -> List[TimelineEntry]:
 		"""Get timeline entries for a pupil.
