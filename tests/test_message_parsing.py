@@ -42,3 +42,35 @@ class MessageParsingTests(unittest.TestCase):
 
 if __name__ == "__main__":
 	unittest.main()
+
+
+class NotificationParsingTests(unittest.TestCase):
+	def setUp(self):
+		path = SOURCE.with_name("notification_parsing.py")
+		spec = importlib.util.spec_from_file_location("notification_parsing", path)
+		self.parser = importlib.util.module_from_spec(spec)
+		spec.loader.exec_module(self.parser)
+
+	def test_extracts_app_data_notification_list(self):
+		items, skipped = self.parser.parse_notification_list({
+			"timestamp": "2026-10-09 21:47:18.601",
+			"notifications": [{"id": 7, "title": "New", "state": "New"}],
+		})
+		self.assertEqual(len(items), 1)
+		self.assertEqual(skipped, 0)
+
+	def test_timestamp_heartbeat_is_not_an_empty_list(self):
+		with self.assertRaises(self.parser.NotificationFormatError):
+			self.parser.parse_notification_list({"timestamp": "2026-10-09 21:44:00.405"})
+
+	def test_explicit_empty_notifications_is_valid(self):
+		self.assertEqual(
+			self.parser.parse_notification_list({"notifications": []}),
+			([], 0),
+		)
+
+	def test_malformed_rows_are_skipped_but_not_silently_all_dropped(self):
+		items, skipped = self.parser.parse_notification_list({"notifications": [{"id": 5}, {"title": "missing id"}]})
+		self.assertEqual((len(items), skipped), (1, 1))
+		with self.assertRaises(self.parser.NotificationFormatError):
+			self.parser.parse_notification_list({"notifications": [{"title": "invalid"}]})
