@@ -9,5 +9,5 @@
 	"iot_class": "cloud_polling",
 	"issue_tracker": "https://github.com/gunnaroi/tormentor/issues",
 	"requirements": ["beautifulsoup4>=4.11.0"],
-	"version": "1.1.6"
+	"version": "1.1.7"
 }
