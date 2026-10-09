@@ -865,14 +865,15 @@ class InfoMentorDataUpdateCoordinator(DataUpdateCoordinator):
 		):
 			return
 
-		self._last_notification_check = now
-
 		try:
 			notifications = await self.client.get_notifications()
 		except Exception as err:
-			_LOGGER.debug("Could not fetch notifications: %s", err)
+			_LOGGER.warning("Could not fetch InfoMentor notifications: %s", err)
 			return
 
+		# Only advance the interval after a successful fetch; transient failures
+		# should be retried on the next coordinator update.
+		self._last_notification_check = now
 		self._notifications = notifications
 		new_notifications: List[InfoMentorNotification] = []
 
